@@ -78,6 +78,24 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 
+def _parse_env_stop_strings() -> list[str]:
+    raw_stop = os.environ.get("VERL_VLLM_STOP")
+    if not raw_stop:
+        return []
+    try:
+        parsed_stop = json.loads(raw_stop)
+    except json.JSONDecodeError:
+        parsed_stop = [raw_stop]
+    if isinstance(parsed_stop, str):
+        parsed_stop = [parsed_stop]
+    return [stop for stop in parsed_stop if isinstance(stop, str) and stop]
+
+
+def _env_flag_enabled(name: str) -> bool:
+    value = os.environ.get(name, "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
 class vLLMHttpServer:
     """vLLM http server in single node, this is equivalent to launch server with command line:
     ```
@@ -517,6 +535,21 @@ class vLLMHttpServer:
         )
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
+        env_stop = _parse_env_stop_strings()
+        if env_stop:
+            sampling_params["stop"] = env_stop
+            sampling_params["include_stop_str_in_output"] = _env_flag_enabled(
+                "VERL_VLLM_INCLUDE_STOP_STR_IN_OUTPUT"
+            )
+        hard_stop_strings = list(sampling_params.get("stop") or [])
+        include_stop_str = bool(sampling_params.get("include_stop_str_in_output", False))
+        if hard_stop_strings and not getattr(self, "_logged_stop_strings", False):
+            logger.info(
+                "Using vLLM stop strings %r, include_stop_str_in_output=%s",
+                hard_stop_strings,
+                include_stop_str,
+            )
+            self._logged_stop_strings = True
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         multi_modal_data = {}
@@ -551,6 +584,11 @@ class vLLMHttpServer:
         final_res: Optional[RequestOutput] = None
         async for output in generator:
             final_res = output
+            if hard_stop_strings and output.outputs:
+                output_text = output.outputs[0].text or ""
+                if any(stop in output_text for stop in hard_stop_strings):
+                    await self.engine.abort(request_id)
+                    break
         assert final_res is not None
 
         token_ids = final_res.outputs[0].token_ids

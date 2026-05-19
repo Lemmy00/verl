@@ -310,8 +310,30 @@ class RewardLoopManager:
         )
         outputs_flat = [item for sublist in outputs for item in sublist]
 
+        reward_extra_infos = [output.get("reward_extra_info", {}) for output in outputs_flat]
+
         # compute rm score
-        scores = [item["reward_score"] for item in outputs_flat]
+        scores = [float(item["reward_score"]) for item in outputs_flat]
+        if any("lean_valid_reward" in info for info in reward_extra_infos):
+            valid_flags = [
+                bool(info.get("lean_valid_reward", True)) and np.isfinite(scores[idx])
+                for idx, info in enumerate(reward_extra_infos)
+            ]
+            uids = data.non_tensor_batch.get("uid", np.arange(len(scores)))
+            grouped_indices = {}
+            for idx, uid in enumerate(uids):
+                grouped_indices.setdefault(uid, []).append(idx)
+
+            for indices in grouped_indices.values():
+                valid_scores = [scores[idx] for idx in indices if valid_flags[idx]]
+                replacement = float(np.mean(valid_scores)) if valid_scores else 0.0
+                for idx in indices:
+                    if not valid_flags[idx]:
+                        scores[idx] = replacement
+
+            for idx, info in enumerate(reward_extra_infos):
+                info["lean_score_for_loss"] = scores[idx]
+
         prompt_length = data.batch["prompts"].size(1)
         valid_response_length = data.batch["attention_mask"][:, prompt_length:].sum(dim=1)
         rm_scores = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
@@ -320,7 +342,6 @@ class RewardLoopManager:
         )
         batch = TensorDict({"rm_scores": rm_scores}, batch_size=len(data))
 
-        reward_extra_infos = [output.get("reward_extra_info", {}) for output in outputs_flat]
         reward_extra_keys = list(reward_extra_infos[0].keys())
         non_tensor_batch = {}
         for key in reward_extra_keys:

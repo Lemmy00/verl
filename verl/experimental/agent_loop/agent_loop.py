@@ -53,6 +53,67 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _hashable_reward_group_id(value, idx: int):
+    if isinstance(value, np.generic):
+        value = value.item()
+    elif isinstance(value, np.ndarray):
+        value = tuple(value.tolist())
+    try:
+        hash(value)
+        return value
+    except TypeError:
+        return repr(value)
+
+
+def _reward_group_ids(input_non_tensor_batch: dict | None, length: int):
+    if input_non_tensor_batch:
+        for key in ("uid", "request_id"):
+            values = input_non_tensor_batch.get(key)
+            if values is not None and len(values) == length:
+                return values
+
+        extra_infos = input_non_tensor_batch.get("extra_info")
+        if extra_infos is not None and len(extra_infos) == length:
+            group_ids = []
+            for idx, info in enumerate(extra_infos):
+                if isinstance(info, dict):
+                    group_ids.append(info.get("uuid") or info.get("uid") or idx)
+                else:
+                    group_ids.append(idx)
+            return np.array(group_ids, dtype=object)
+
+    return np.arange(length)
+
+
+def _impute_invalid_lean_scores(
+    scores: list[float],
+    reward_extra_infos: list[dict],
+    input_non_tensor_batch: dict | None,
+) -> list[float]:
+    if not any("lean_valid_reward" in info for info in reward_extra_infos):
+        return scores
+
+    scores = [float(score) for score in scores]
+    valid_flags = [
+        bool(info.get("lean_valid_reward", True)) and np.isfinite(scores[idx])
+        for idx, info in enumerate(reward_extra_infos)
+    ]
+    grouped_indices = {}
+    for idx, group_id in enumerate(_reward_group_ids(input_non_tensor_batch, len(scores))):
+        grouped_indices.setdefault(_hashable_reward_group_id(group_id, idx), []).append(idx)
+
+    for indices in grouped_indices.values():
+        valid_scores = [scores[idx] for idx in indices if valid_flags[idx]]
+        replacement = float(np.mean(valid_scores)) if valid_scores else 0.0
+        for idx in indices:
+            if not valid_flags[idx]:
+                scores[idx] = replacement
+
+    for idx, info in enumerate(reward_extra_infos):
+        info["lean_score_for_loss"] = scores[idx]
+    return scores
+
+
 class AsyncLLMServerManager:
     """
     A class to manage multiple OpenAI compatible LLM servers. This class provides
@@ -421,6 +482,20 @@ class AgentLoopWorker:
             repetition_penalty=1.0,
             logprobs=config.calculate_log_probs,
         )
+        # Optional stop strings, e.g. actor_rollout_ref.rollout.custom.stop='["```\n","``` "]'
+        try:
+            custom_config = config.get("custom", {}) or {}
+            stop_strings = custom_config.get("stop", None)
+            if stop_strings:
+                sampling_params["stop"] = list(stop_strings)
+            if custom_config.get("include_stop_str_in_output", None) is not None:
+                sampling_params["include_stop_str_in_output"] = bool(
+                    custom_config["include_stop_str_in_output"]
+                )
+            if custom_config.get("sampling_params", None):
+                sampling_params.update(dict(custom_config["sampling_params"]))
+        except Exception as exc:
+            logger.warning("Failed to apply custom rollout sampling params: %s", exc)
 
         # override sampling params for validation
         if batch.meta_info.get("validate", False):
@@ -750,8 +825,10 @@ class AgentLoopWorker:
             batch_size=len(inputs),
         )
 
+        reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) or {} for input in inputs]
         scores = [input.reward_score for input in inputs]
         if all(score is not None for score in scores):
+            scores = _impute_invalid_lean_scores(scores, reward_extra_infos, input_non_tensor_batch)
             prompt_length = prompt_ids.size(1)
             response_length = attention_mask[:, prompt_length:].sum(dim=1) - 1
             rm_scores = torch.zeros_like(response_mask, dtype=torch.float32)
@@ -765,7 +842,6 @@ class AgentLoopWorker:
             non_tensor_batch.update(input_non_tensor_batch)
 
         # add reward_extra_info to non_tensor_batch
-        reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
         reward_extra_keys = list(reward_extra_infos[0].keys())
         for key in reward_extra_keys:
             non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])

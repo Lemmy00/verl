@@ -390,6 +390,17 @@ class RayPPOTrainer:
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
 
+        def json_safe(value):
+            if isinstance(value, np.generic):
+                return value.item()
+            if isinstance(value, torch.Tensor):
+                return value.detach().cpu().tolist()
+            if isinstance(value, dict):
+                return {str(k): json_safe(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [json_safe(v) for v in value]
+            return value
+
         n = len(inputs)
         base_data = {
             "input": inputs,
@@ -405,7 +416,7 @@ class RayPPOTrainer:
 
         lines = []
         for i in range(n):
-            entry = {k: v[i] for k, v in base_data.items()}
+            entry = {k: json_safe(v[i]) for k, v in base_data.items()}
             lines.append(json.dumps(entry, ensure_ascii=False))
 
         with open(filename, "w") as f:

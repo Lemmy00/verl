@@ -27,6 +27,7 @@ from .optimizer import OptimizerConfig
 
 __all__ = [
     "PolicyLossConfig",
+    "FeedbackLossConfig",
     "RouterReplayConfig",
     "ActorConfig",
     "FSDPActorConfig",
@@ -85,6 +86,18 @@ class PolicyLossConfig(BaseConfig):
     clip_cov_ub: float = 5.0
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
+
+
+@dataclass
+class FeedbackLossConfig(BaseConfig):
+    """Auxiliary supervised loss for canonical Lean feedback blocks."""
+
+    enabled: bool = False
+    lambda_coef: float = 1.0
+    feedback_weight: float = 0.3
+    error_feedback_weight: float = 0.5
+    theorem_statement_enabled: bool = True
+    theorem_statement_weight: float = 0.05
 
 
 @dataclass
@@ -147,6 +160,7 @@ class ActorConfig(BaseConfig):
     clip_ratio_high: float = 0.2
     freeze_vision_tower: bool = False
     policy_loss: PolicyLossConfig = field(default_factory=PolicyLossConfig)
+    feedback_loss: FeedbackLossConfig = field(default_factory=FeedbackLossConfig)
     clip_ratio_c: float = 3.0
     loss_agg_mode: str = "token-mean"
     loss_scale_factor: Optional[int] = None

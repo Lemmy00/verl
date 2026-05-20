@@ -270,6 +270,7 @@ def compute_grpo_outcome_advantage(
     index: np.ndarray,
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: bool = True,
+    valid_reward_mask: Optional[torch.Tensor] = None,
     config: Optional[AlgoConfig] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -301,6 +302,10 @@ def compute_grpo_outcome_advantage(
             shape is (bs, response_length)
     """
     scores = token_level_rewards.sum(dim=-1)
+    if valid_reward_mask is None:
+        valid_reward_mask = torch.ones_like(scores, dtype=torch.bool)
+    else:
+        valid_reward_mask = valid_reward_mask.to(device=scores.device, dtype=torch.bool).reshape(-1)
 
     id2score = defaultdict(list)
     id2mean = {}
@@ -309,10 +314,11 @@ def compute_grpo_outcome_advantage(
     with torch.no_grad():
         bsz = scores.shape[0]
         for i in range(bsz):
-            id2score[index[i]].append(scores[i])
+            if valid_reward_mask[i]:
+                id2score[index[i]].append(scores[i])
         for idx in id2score:
             if len(id2score[idx]) == 1:
-                id2mean[idx] = torch.tensor(0.0)
+                id2mean[idx] = id2score[idx][0]
                 id2std[idx] = torch.tensor(1.0)
             elif len(id2score[idx]) > 1:
                 scores_tensor = torch.stack(id2score[idx])
@@ -321,11 +327,13 @@ def compute_grpo_outcome_advantage(
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
         for i in range(bsz):
-            if norm_adv_by_std_in_grpo:
+            if index[i] not in id2mean or not valid_reward_mask[i]:
+                scores[i] = 0.0
+            elif norm_adv_by_std_in_grpo:
                 scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
             else:
                 scores[i] = scores[i] - id2mean[index[i]]
-        scores = scores.unsqueeze(-1) * response_mask
+        scores = scores.unsqueeze(-1) * response_mask * valid_reward_mask.to(response_mask.dtype).unsqueeze(-1)
 
     return scores, scores
 

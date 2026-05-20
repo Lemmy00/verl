@@ -22,6 +22,34 @@ import numpy as np
 import torch
 
 
+def _metric_values(value: Any) -> list[float]:
+    if isinstance(value, Metric):
+        return [float(value.aggregate())]
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return []
+        return [float(value.detach().float().mean().item())]
+    if isinstance(value, np.ndarray):
+        if value.size == 0:
+            return []
+        if value.dtype == object:
+            values: list[float] = []
+            for item in value.tolist():
+                values.extend(_metric_values(item))
+            return values
+        return [float(np.mean(value))]
+    if isinstance(value, (list, tuple)):
+        values: list[float] = []
+        for item in value:
+            values.extend(_metric_values(item))
+        return values
+    if isinstance(value, np.generic):
+        return [float(value.item())]
+    if isinstance(value, (int, float)):
+        return [float(value)]
+    return []
+
+
 def reduce_metrics(metrics: dict[str, Union["Metric", list[Any]]]) -> dict[str, Any]:
     """
     Reduces a dictionary of metric lists by computing the mean, max, or min of each list.
@@ -49,12 +77,16 @@ def reduce_metrics(metrics: dict[str, Union["Metric", list[Any]]]) -> dict[str, 
     for key, val in metrics.items():
         if isinstance(val, Metric):
             metrics[key] = val.aggregate()
-        elif "max" in key:
-            metrics[key] = np.max(val)
-        elif "min" in key:
-            metrics[key] = np.min(val)
         else:
-            metrics[key] = np.mean(val)
+            values = _metric_values(val)
+            if not values:
+                metrics[key] = 0.0
+            elif "max" in key:
+                metrics[key] = np.max(values)
+            elif "min" in key:
+                metrics[key] = np.min(values)
+            else:
+                metrics[key] = np.mean(values)
     return metrics
 
 

@@ -26,6 +26,52 @@ from verl.workers.config import ActorConfig, CriticConfig
 from verl.workers.utils.padding import no_padding_2_padding
 
 
+def _feedback_loss_config(config: ActorConfig):
+    feedback_cfg = config.get("feedback_loss", None)
+    enabled = bool(getattr(feedback_cfg, "enabled", False)) if feedback_cfg is not None else False
+    lambda_coef = float(getattr(feedback_cfg, "lambda_coef", 1.0)) if feedback_cfg is not None else 1.0
+    return enabled, lambda_coef
+
+
+def _weighted_feedback_ce(
+    log_prob: torch.Tensor,
+    weights: torch.Tensor,
+    error_weights: torch.Tensor | None = None,
+    theorem_statement_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    weights = weights.to(device=log_prob.device, dtype=log_prob.dtype)
+    ce = -log_prob
+    weight_sum = weights.sum()
+    loss = (ce * weights).sum() / torch.clamp(weight_sum, min=1.0)
+
+    active_tokens = (weights > 0).sum().to(log_prob.dtype)
+    metrics = {
+        "actor/feedback_ce_loss": loss.detach(),
+        "actor/feedback_active_tokens": active_tokens.detach(),
+        "actor/feedback_weight_sum": weight_sum.detach(),
+    }
+
+    if error_weights is not None:
+        error_weights = error_weights.to(device=log_prob.device, dtype=log_prob.dtype)
+        error_weight_sum = error_weights.sum()
+        error_loss = (ce * error_weights).sum() / torch.clamp(error_weight_sum, min=1.0)
+        metrics["actor/error_feedback_ce_loss"] = error_loss.detach()
+        metrics["actor/error_feedback_active_tokens"] = (error_weights > 0).sum().to(log_prob.dtype).detach()
+        metrics["actor/error_feedback_weight_sum"] = error_weight_sum.detach()
+
+    if theorem_statement_weights is not None:
+        theorem_statement_weights = theorem_statement_weights.to(device=log_prob.device, dtype=log_prob.dtype)
+        theorem_weight_sum = theorem_statement_weights.sum()
+        theorem_loss = (ce * theorem_statement_weights).sum() / torch.clamp(theorem_weight_sum, min=1.0)
+        metrics["actor/theorem_statement_ce_loss"] = theorem_loss.detach()
+        metrics["actor/theorem_statement_active_tokens"] = (
+            theorem_statement_weights > 0
+        ).sum().to(log_prob.dtype).detach()
+        metrics["actor/theorem_statement_weight_sum"] = theorem_weight_sum.detach()
+
+    return loss, metrics
+
+
 def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
     pad_mode = tu.get_non_tensor_data(data=data, key="pad_mode", default=DatasetPadMode.NO_PADDING)
     dp_size = data["dp_size"]
@@ -122,7 +168,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
     metrics = {}
 
-    response_mask = data["response_mask"].to(bool)
+    response_mask = data.get("ppo_response_mask", data["response_mask"]).to(bool)
     # compute policy loss
     old_log_prob = data["old_log_probs"]
     advantages = data["advantages"]
@@ -133,15 +179,19 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     loss_mode = config.policy_loss.get("loss_mode", "vanilla")
 
     policy_loss_fn = get_policy_loss_fn(loss_mode)
-    pg_loss, pg_metrics = policy_loss_fn(
-        old_log_prob=old_log_prob,
-        log_prob=log_prob,
-        advantages=advantages,
-        response_mask=response_mask,
-        loss_agg_mode=loss_agg_mode,
-        config=config,
-        rollout_is_weights=rollout_is_weights,
-    )
+    if response_mask.any():
+        pg_loss, pg_metrics = policy_loss_fn(
+            old_log_prob=old_log_prob,
+            log_prob=log_prob,
+            advantages=advantages,
+            response_mask=response_mask,
+            loss_agg_mode=loss_agg_mode,
+            config=config,
+            rollout_is_weights=rollout_is_weights,
+        )
+    else:
+        pg_loss = log_prob.sum() * 0.0
+        pg_metrics = {}
 
     # AggregationType.MEAN for pg metrics: assumes policy_loss_fn normalizes by local_bsz/local_tokens
     # Ex: in compute_policy_loss_vanilla, pg_metrics are pg_clipfrac, ppo_kl, pg_clipfrac_lower
@@ -153,9 +203,12 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
     # add entropy loss
     if entropy is not None:
-        entropy_loss = agg_loss(
-            loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
-        )
+        if response_mask.any():
+            entropy_loss = agg_loss(
+                loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
+            )
+        else:
+            entropy_loss = log_prob.sum() * 0.0
         entropy_coeff = config.entropy_coeff
         policy_loss -= entropy_coeff * entropy_loss
         metrics["actor/entropy_loss"] = Metric(value=entropy_loss, aggregation=metric_aggregation)
@@ -165,13 +218,31 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         ref_log_prob = data["ref_log_prob"]
         # compute kl loss
         kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=config.kl_loss_type)
-        kl_loss = agg_loss(
-            loss_mat=kld, loss_mask=response_mask, loss_agg_mode=config.loss_agg_mode, **config.global_batch_info
-        )
+        if response_mask.any():
+            kl_loss = agg_loss(
+                loss_mat=kld, loss_mask=response_mask, loss_agg_mode=config.loss_agg_mode, **config.global_batch_info
+            )
+        else:
+            kl_loss = log_prob.sum() * 0.0
 
         policy_loss += kl_loss * config.kl_loss_coef
         metrics["kl_loss"] = Metric(value=kl_loss, aggregation=metric_aggregation)
         metrics["kl_coef"] = config.kl_loss_coef
+
+    feedback_enabled, feedback_lambda = _feedback_loss_config(config)
+    feedback_weights = data.get("feedback_loss_weights", None)
+    if feedback_enabled and feedback_weights is not None:
+        error_weights = data.get("error_feedback_loss_weights", None)
+        theorem_statement_weights = data.get("theorem_statement_loss_weights", None)
+        feedback_loss, feedback_metrics = _weighted_feedback_ce(
+            log_prob, feedback_weights, error_weights, theorem_statement_weights
+        )
+        policy_loss += feedback_lambda * feedback_loss
+        feedback_metrics["actor/feedback_lambda"] = torch.tensor(
+            feedback_lambda, device=log_prob.device, dtype=log_prob.dtype
+        )
+        feedback_metrics["actor/feedback_aux_loss"] = (feedback_lambda * feedback_loss).detach()
+        metrics.update(Metric.from_dict(feedback_metrics, aggregation=metric_aggregation))
 
     return policy_loss, metrics
 

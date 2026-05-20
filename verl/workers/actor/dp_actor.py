@@ -515,6 +515,14 @@ class DataParallelPPOActor(BasePPOActor):
             "old_log_probs",
             "advantages",
         ]
+        if "ppo_response_mask" in data.batch.keys():
+            select_keys.append("ppo_response_mask")
+        if "feedback_loss_weights" in data.batch.keys():
+            select_keys.append("feedback_loss_weights")
+        if "error_feedback_loss_weights" in data.batch.keys():
+            select_keys.append("error_feedback_loss_weights")
+        if "theorem_statement_loss_weights" in data.batch.keys():
+            select_keys.append("theorem_statement_loss_weights")
         if self.use_prefix_grouper and "prompts" in data.batch.keys():
             select_keys.append("prompts")
         if self.config.use_kl_loss:
@@ -564,6 +572,7 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
                     response_mask = model_inputs["response_mask"]
+                    ppo_response_mask = model_inputs.get("ppo_response_mask", response_mask).to(bool)
                     old_log_prob = model_inputs["old_log_probs"]
                     advantages = model_inputs["advantages"]
 
@@ -605,15 +614,19 @@ class DataParallelPPOActor(BasePPOActor):
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
 
                     # Compute policy loss (any function is expected to return 2 values)
-                    pg_loss, pg_metrics = policy_loss_fn(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        loss_agg_mode=loss_agg_mode,
-                        config=self.config,
-                        rollout_is_weights=rollout_is_weights,
-                    )
+                    if ppo_response_mask.any():
+                        pg_loss, pg_metrics = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=ppo_response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                        )
+                    else:
+                        pg_loss = log_prob.sum() * 0.0
+                        pg_metrics = {}
                     micro_batch_metrics.update(pg_metrics)
 
                     # Skip if using bypass_mode loss (metrics already computed in pg_metrics)
@@ -623,16 +636,22 @@ class DataParallelPPOActor(BasePPOActor):
                         # Tracks evolving off-policy gap as π_θ updates during mini-batch training
                         from verl.trainer.ppo.rollout_corr_helper import compute_rollout_corr_metrics_from_logprobs
 
-                        rollout_corr_metrics = compute_rollout_corr_metrics_from_logprobs(
-                            log_prob=log_prob,
-                            rollout_log_prob=rollout_log_prob,
-                            response_mask=response_mask,
-                        )
-                        micro_batch_metrics.update(rollout_corr_metrics)
+                        if ppo_response_mask.any():
+                            rollout_corr_metrics = compute_rollout_corr_metrics_from_logprobs(
+                                log_prob=log_prob,
+                                rollout_log_prob=rollout_log_prob,
+                                response_mask=ppo_response_mask,
+                            )
+                            micro_batch_metrics.update(rollout_corr_metrics)
 
                     policy_loss = pg_loss
                     if calculate_entropy and entropy is not None:
-                        entropy_agg = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        if ppo_response_mask.any():
+                            entropy_agg = agg_loss(
+                                loss_mat=entropy, loss_mask=ppo_response_mask, loss_agg_mode=loss_agg_mode
+                            )
+                        else:
+                            entropy_agg = log_prob.sum() * 0.0
                         micro_batch_metrics["actor/entropy"] = entropy_agg.detach().item()
                         if entropy_coeff != 0:
                             policy_loss -= entropy_agg * entropy_coeff
@@ -643,11 +662,58 @@ class DataParallelPPOActor(BasePPOActor):
                         kld = kl_penalty(
                             logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
                         )
-                        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        if ppo_response_mask.any():
+                            kl_loss = agg_loss(loss_mat=kld, loss_mask=ppo_response_mask, loss_agg_mode=loss_agg_mode)
+                        else:
+                            kl_loss = log_prob.sum() * 0.0
 
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                         metrics["actor/kl_loss"] += kl_loss.detach().item() * loss_scale_factor
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
+
+                    feedback_cfg = self.config.get("feedback_loss", None)
+                    feedback_enabled = bool(getattr(feedback_cfg, "enabled", False)) if feedback_cfg is not None else False
+                    feedback_lambda = (
+                        float(getattr(feedback_cfg, "lambda_coef", 1.0)) if feedback_cfg is not None else 1.0
+                    )
+                    feedback_weights = model_inputs.get("feedback_loss_weights", None)
+                    if feedback_enabled and feedback_weights is not None:
+                        feedback_weights = feedback_weights.to(device=log_prob.device, dtype=log_prob.dtype)
+                        ce = -log_prob
+                        feedback_weight_sum = feedback_weights.sum()
+                        feedback_loss = (ce * feedback_weights).sum() / torch.clamp(feedback_weight_sum, min=1.0)
+                        policy_loss = policy_loss + feedback_lambda * feedback_loss
+                        micro_batch_metrics["actor/feedback_ce_loss"] = feedback_loss.detach().item()
+                        micro_batch_metrics["actor/feedback_lambda"] = feedback_lambda
+                        micro_batch_metrics["actor/feedback_aux_loss"] = (feedback_lambda * feedback_loss).detach().item()
+                        micro_batch_metrics["actor/feedback_active_tokens"] = (
+                            (feedback_weights > 0).sum().detach().item()
+                        )
+                        micro_batch_metrics["actor/feedback_weight_sum"] = feedback_weight_sum.detach().item()
+                        error_weights = model_inputs.get("error_feedback_loss_weights", None)
+                        if error_weights is not None:
+                            error_weights = error_weights.to(device=log_prob.device, dtype=log_prob.dtype)
+                            error_weight_sum = error_weights.sum()
+                            error_loss = (ce * error_weights).sum() / torch.clamp(error_weight_sum, min=1.0)
+                            micro_batch_metrics["actor/error_feedback_ce_loss"] = error_loss.detach().item()
+                            micro_batch_metrics["actor/error_feedback_active_tokens"] = (
+                                (error_weights > 0).sum().detach().item()
+                            )
+                            micro_batch_metrics["actor/error_feedback_weight_sum"] = error_weight_sum.detach().item()
+                        theorem_statement_weights = model_inputs.get("theorem_statement_loss_weights", None)
+                        if theorem_statement_weights is not None:
+                            theorem_statement_weights = theorem_statement_weights.to(
+                                device=log_prob.device, dtype=log_prob.dtype
+                            )
+                            theorem_weight_sum = theorem_statement_weights.sum()
+                            theorem_loss = (ce * theorem_statement_weights).sum() / torch.clamp(
+                                theorem_weight_sum, min=1.0
+                            )
+                            micro_batch_metrics["actor/theorem_statement_ce_loss"] = theorem_loss.detach().item()
+                            micro_batch_metrics["actor/theorem_statement_active_tokens"] = (
+                                (theorem_statement_weights > 0).sum().detach().item()
+                            )
+                            micro_batch_metrics["actor/theorem_statement_weight_sum"] = theorem_weight_sum.detach().item()
 
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz

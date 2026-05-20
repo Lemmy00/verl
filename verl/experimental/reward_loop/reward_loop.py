@@ -35,6 +35,12 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _object_array_1d(values):
+    arr = np.empty(len(values), dtype=object)
+    arr[:] = values
+    return arr
+
+
 def migrate_legacy_reward_impl(config):
     """
     Migrate the legacy reward model implementation to the new one.
@@ -319,17 +325,9 @@ class RewardLoopManager:
                 bool(info.get("lean_valid_reward", True)) and np.isfinite(scores[idx])
                 for idx, info in enumerate(reward_extra_infos)
             ]
-            uids = data.non_tensor_batch.get("uid", np.arange(len(scores)))
-            grouped_indices = {}
-            for idx, uid in enumerate(uids):
-                grouped_indices.setdefault(uid, []).append(idx)
-
-            for indices in grouped_indices.values():
-                valid_scores = [scores[idx] for idx in indices if valid_flags[idx]]
-                replacement = float(np.mean(valid_scores)) if valid_scores else 0.0
-                for idx in indices:
-                    if not valid_flags[idx]:
-                        scores[idx] = replacement
+            for idx, is_valid in enumerate(valid_flags):
+                if not is_valid:
+                    scores[idx] = 0.0
 
             for idx, info in enumerate(reward_extra_infos):
                 info["lean_score_for_loss"] = scores[idx]
@@ -345,7 +343,7 @@ class RewardLoopManager:
         reward_extra_keys = list(reward_extra_infos[0].keys())
         non_tensor_batch = {}
         for key in reward_extra_keys:
-            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
+            non_tensor_batch[key] = _object_array_1d([info[key] for info in reward_extra_infos])
 
         if self.reward_model_manager is not None:
             self.reward_model_manager.sleep()

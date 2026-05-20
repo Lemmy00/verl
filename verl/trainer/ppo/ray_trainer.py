@@ -24,6 +24,7 @@ import uuid
 from collections import defaultdict
 from copy import deepcopy
 from pprint import pprint
+import re
 from typing import Any, Optional
 
 import numpy as np
@@ -57,6 +58,7 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.metric import reduce_metrics
+from verl.utils.model import compute_position_id_with_mask
 from verl.utils.py_functional import rename_dict
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
@@ -64,6 +66,12 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
+
+def _object_array_1d(values):
+    arr = np.empty(len(values), dtype=object)
+    arr[:] = values
+    return arr
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -126,6 +134,50 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
+def _truthy(value) -> bool:
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def _lean_valid_reward_mask(reward_extra_infos_dict: dict, length: int, device: torch.device) -> torch.Tensor | None:
+    valid_flags = reward_extra_infos_dict.get("lean_valid_reward", None)
+    if valid_flags is None or len(valid_flags) != length:
+        return None
+    return torch.tensor([_truthy(flag) for flag in valid_flags], dtype=torch.bool, device=device)
+
+
+_GENERATED_FEEDBACK_BLOCK_RES = [
+    re.compile(r"--\s*<feedback>\n[\s\S]*?--\s*</feedback>\n?", re.MULTILINE),
+    re.compile(r"/-\s*<feedback>\n[\s\S]*?</feedback>\s*-/\n?", re.MULTILINE),
+    re.compile(r"<feedback>\n?[\s\S]*?</feedback>\s*", re.MULTILINE),
+    re.compile(r"/-\s*<unsolved goals>\n[\s\S]*?</unsolved goals>\s*-/\n?", re.MULTILINE),
+]
+
+
+def _generated_feedback_spans(text: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for pattern in _GENERATED_FEEDBACK_BLOCK_RES:
+        spans.extend((match.start(), match.end()) for match in pattern.finditer(text or ""))
+    if not spans:
+        return []
+
+    spans.sort()
+    merged: list[tuple[int, int]] = []
+    for start, end in spans:
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    return merged
+
+
+def _span_overlaps(start: int, end: int, spans) -> bool:
+    return any(start < int(span_end) and end > int(span_start) for span_start, span_end in spans or [])
+
+
 def compute_advantage(
     data: DataProto,
     adv_estimator: AdvantageEstimator,
@@ -184,6 +236,7 @@ def compute_advantage(
             response_mask=grpo_calculation_mask,
             index=data.non_tensor_batch["uid"],
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            valid_reward_mask=data.batch.get("valid_reward_mask", None),
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
@@ -455,6 +508,368 @@ class RayPPOTrainer:
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
                 dump_path=rollout_data_dir,
             )
+
+    def _lean_reward_diagnostics(self, reward_tensor: torch.Tensor, reward_extra_infos_dict: dict) -> dict[str, Any]:
+        metrics: dict[str, Any] = {}
+        if not reward_extra_infos_dict:
+            return metrics
+
+        statuses = list(reward_extra_infos_dict.get("lean_status", []))
+        if statuses:
+            total = max(len(statuses), 1)
+            for status, count in defaultdict(int, {s: statuses.count(s) for s in set(statuses)}).items():
+                metrics[f"lean/status/{status}"] = count
+                metrics[f"lean/status_rate/{status}"] = count / total
+            metrics["lean/valid_proof_rate"] = statuses.count("verified") / total
+            metrics["lean/infra_failure_rate"] = sum("infra" in str(status) for status in statuses) / total
+
+        valid_flags = reward_extra_infos_dict.get("lean_valid_reward", None)
+        if valid_flags is not None and len(valid_flags) > 0:
+            metrics["lean/valid_reward_rate"] = float(np.mean([_truthy(v) for v in valid_flags]))
+
+        canonical_flags = reward_extra_infos_dict.get("has_canonical_feedback", None)
+        if canonical_flags is not None and len(canonical_flags) > 0:
+            metrics["feedback/canonical_success_rate"] = float(np.mean([_truthy(v) for v in canonical_flags]))
+
+        loss_reward_mean = reward_tensor.sum(dim=-1).float().mean().detach().item()
+        metrics["lean/loss_reward_mean"] = loss_reward_mean
+        lean_scores = reward_extra_infos_dict.get("lean_score", None)
+        if lean_scores is not None and len(lean_scores) > 0:
+            metrics["lean/reward_mean"] = float(np.mean([float(score) for score in lean_scores]))
+        else:
+            metrics["lean/reward_mean"] = loss_reward_mean
+        return metrics
+
+    def _proof_action_response_mask(self, batch: DataProto, metrics: dict[str, Any]) -> torch.Tensor | None:
+        responses = batch.batch.get("responses", None)
+        response_mask = batch.batch.get("response_mask", None)
+        if responses is None or response_mask is None:
+            return None
+
+        max_response_len = responses.shape[1]
+        action_mask = response_mask.clone()
+        masked_tokens = 0
+        feedback_rows = 0
+        mismatch_rows = 0
+
+        responses_cpu = responses.detach().cpu()
+        response_lengths = response_mask.detach().sum(dim=1).long().cpu().tolist()
+        for row_idx, valid_len in enumerate(response_lengths):
+            if valid_len <= 0:
+                continue
+
+            token_ids = responses_cpu[row_idx, :valid_len].tolist()
+            text = self.tokenizer.decode(token_ids, skip_special_tokens=True)
+            spans = _generated_feedback_spans(text)
+            if not spans:
+                continue
+
+            feedback_rows += 1
+            try:
+                encoded = self.tokenizer(
+                    text,
+                    add_special_tokens=False,
+                    max_length=max_response_len,
+                    truncation=True,
+                    return_offsets_mapping=True,
+                )
+                offsets = list(encoded.get("offset_mapping", []))
+            except Exception:
+                mismatch_rows += 1
+                continue
+
+            if abs(len(offsets) - valid_len) > 2:
+                mismatch_rows += 1
+
+            limit = min(valid_len, len(offsets), max_response_len)
+            for token_idx in range(limit):
+                start, end = offsets[token_idx]
+                if end <= start:
+                    continue
+                if _span_overlaps(start, end, spans):
+                    if action_mask[row_idx, token_idx] != 0:
+                        masked_tokens += 1
+                    action_mask[row_idx, token_idx] = 0
+
+        if feedback_rows:
+            denom = max(float(response_mask.sum().detach().item()), 1.0)
+            metrics["feedback/generated_feedback_rows"] = feedback_rows
+            metrics["feedback/generated_feedback_masked_tokens"] = float(masked_tokens)
+            metrics["feedback/generated_feedback_masked_token_rate"] = float(masked_tokens) / denom
+            metrics["feedback/generated_feedback_tokenizer_mismatch_rows"] = mismatch_rows
+
+        return action_mask
+
+    def _tokenize_aux_target(self, text: str, max_response_len: int) -> tuple[list[int], list[tuple[int, int]], bool]:
+        if not text:
+            return [], [], False
+
+        try:
+            encoded = self.tokenizer(
+                text,
+                add_special_tokens=False,
+                max_length=max_response_len,
+                truncation=True,
+                return_offsets_mapping=True,
+            )
+            offsets = list(encoded.get("offset_mapping", []))
+            token_ids = list(encoded["input_ids"])
+        except Exception:
+            encoded = self.tokenizer(
+                text,
+                add_special_tokens=False,
+                max_length=max_response_len,
+                truncation=True,
+            )
+            offsets = []
+            token_ids = list(encoded["input_ids"])
+
+        truncated = len(token_ids) >= max_response_len and bool(text)
+        return token_ids, offsets, truncated
+
+    def _feedback_token_weights(
+        self,
+        text: str,
+        spans,
+        error_spans,
+        max_response_len: int,
+        feedback_token_weight: float = 0.3,
+        error_feedback_token_weight: float = 0.5,
+    ):
+        feedback_weights = torch.zeros(max_response_len, dtype=torch.float32)
+        error_weight = torch.zeros(max_response_len, dtype=torch.float32)
+        if not text:
+            return [], feedback_weights, error_weight, False
+
+        token_ids, offsets, truncated = self._tokenize_aux_target(text, max_response_len)
+        limit = len(token_ids)
+        for idx in range(limit):
+            if idx >= len(offsets):
+                break
+            start, end = offsets[idx]
+            if end <= start:
+                continue
+            if _span_overlaps(start, end, error_spans):
+                feedback_weights[idx] = error_feedback_token_weight
+                error_weight[idx] = error_feedback_token_weight
+            elif _span_overlaps(start, end, spans):
+                feedback_weights[idx] = feedback_token_weight
+        return token_ids, feedback_weights, error_weight, truncated
+
+    def _uniform_token_weights(self, text: str, max_response_len: int, weight: float):
+        token_ids, _, truncated = self._tokenize_aux_target(text, max_response_len)
+        weights = torch.zeros(max_response_len, dtype=torch.float32)
+        if token_ids and weight > 0:
+            weights[: len(token_ids)] = weight
+        return token_ids, weights, truncated
+
+    def _maybe_append_feedback_aux_batch(self, batch: DataProto, metrics: dict[str, Any]) -> DataProto:
+        feedback_cfg = self.config.actor_rollout_ref.actor.get("feedback_loss", {})
+        if not _truthy(feedback_cfg.get("enabled", False)):
+            return batch
+
+        feedback_token_weight = float(feedback_cfg.get("feedback_weight", 0.3))
+        error_feedback_token_weight = float(feedback_cfg.get("error_feedback_weight", 0.5))
+        theorem_statement_enabled = _truthy(feedback_cfg.get("theorem_statement_enabled", True))
+        theorem_statement_weight = float(feedback_cfg.get("theorem_statement_weight", 0.05))
+
+        canonical_codes = batch.non_tensor_batch.get("canonical_annotated_code", _object_array_1d(["" for _ in range(len(batch))]))
+        feedback_spans = batch.non_tensor_batch.get("feedback_spans", _object_array_1d([[] for _ in range(len(batch))]))
+        error_spans = batch.non_tensor_batch.get(
+            "error_feedback_spans", _object_array_1d([[] for _ in range(len(batch))])
+        )
+        has_canonical = batch.non_tensor_batch.get(
+            "has_canonical_feedback", _object_array_1d([False for _ in range(len(batch))])
+        )
+        theorem_targets = batch.non_tensor_batch.get(
+            "theorem_statement_target", _object_array_1d(["" for _ in range(len(batch))])
+        )
+        valid_reward_flags = batch.non_tensor_batch.get(
+            "lean_valid_reward", _object_array_1d([True for _ in range(len(batch))])
+        )
+
+        base = batch.batch
+        bsz = len(batch)
+        max_response_len = base["responses"].shape[1]
+        prompt_len = base["prompts"].shape[1]
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else 0
+
+        aux_responses: list[torch.Tensor] = []
+        aux_response_masks: list[torch.Tensor] = []
+        aux_feedback_weights: list[torch.Tensor] = []
+        aux_error_weights: list[torch.Tensor] = []
+        aux_theorem_weights: list[torch.Tensor] = []
+        source_indices: list[int] = []
+        feedback_aux_rows = 0
+        theorem_aux_rows = 0
+        padding_aux_rows = 0
+        truncated_feedback_targets = 0
+        truncated_theorem_targets = 0
+
+        for idx, (code, spans, err_spans, flag) in enumerate(
+            zip(canonical_codes, feedback_spans, error_spans, has_canonical, strict=True)
+        ):
+            if not _truthy(flag) or not isinstance(code, str) or not code.strip():
+                continue
+            token_ids, weights, err_weights, truncated = self._feedback_token_weights(
+                code,
+                spans,
+                err_spans,
+                max_response_len,
+                feedback_token_weight=feedback_token_weight,
+                error_feedback_token_weight=error_feedback_token_weight,
+            )
+            if not token_ids or weights.sum().item() <= 0:
+                continue
+            truncated_feedback_targets += int(truncated)
+            n_tokens = len(token_ids)
+            response = torch.full((max_response_len,), int(pad_token_id), dtype=base["responses"].dtype, device=base["responses"].device)
+            response_mask = torch.zeros((max_response_len,), dtype=base["response_mask"].dtype, device=base["response_mask"].device)
+            response[:n_tokens] = torch.tensor(token_ids, dtype=response.dtype, device=response.device)
+            response_mask[:n_tokens] = 1
+            aux_responses.append(response)
+            aux_response_masks.append(response_mask)
+            aux_feedback_weights.append(weights.to(base["responses"].device))
+            aux_error_weights.append(err_weights.to(base["responses"].device))
+            aux_theorem_weights.append(torch.zeros(max_response_len, dtype=torch.float32, device=base["responses"].device))
+            source_indices.append(idx)
+            feedback_aux_rows += 1
+
+        if theorem_statement_enabled and theorem_statement_weight > 0:
+            for idx, (target, valid_reward) in enumerate(zip(theorem_targets, valid_reward_flags, strict=True)):
+                if not _truthy(valid_reward) or not isinstance(target, str) or not target.strip():
+                    continue
+                token_ids, weights, truncated = self._uniform_token_weights(
+                    target, max_response_len, theorem_statement_weight
+                )
+                if not token_ids or weights.sum().item() <= 0:
+                    continue
+                truncated_theorem_targets += int(truncated)
+                n_tokens = len(token_ids)
+                response = torch.full(
+                    (max_response_len,),
+                    int(pad_token_id),
+                    dtype=base["responses"].dtype,
+                    device=base["responses"].device,
+                )
+                response_mask = torch.zeros(
+                    (max_response_len,), dtype=base["response_mask"].dtype, device=base["response_mask"].device
+                )
+                response[:n_tokens] = torch.tensor(token_ids, dtype=response.dtype, device=response.device)
+                response_mask[:n_tokens] = 1
+                aux_responses.append(response)
+                aux_response_masks.append(response_mask)
+                aux_feedback_weights.append(torch.zeros(max_response_len, dtype=torch.float32, device=base["responses"].device))
+                aux_error_weights.append(torch.zeros(max_response_len, dtype=torch.float32, device=base["responses"].device))
+                aux_theorem_weights.append(weights.to(base["responses"].device))
+                source_indices.append(idx)
+                theorem_aux_rows += 1
+
+        if not aux_responses:
+            metrics["feedback/active_tokens"] = 0.0
+            metrics["feedback/theorem_statement_active_tokens"] = 0.0
+            return batch
+
+        dp_size = int(self.config.trainer.get("n_gpus_per_node", 1)) * int(self.config.trainer.get("nnodes", 1))
+        dp_size = max(dp_size, 1)
+        remainder = (bsz + len(aux_responses)) % dp_size
+        if remainder:
+            padding_aux_rows = dp_size - remainder
+            for _ in range(padding_aux_rows):
+                aux_responses.append(
+                    torch.full(
+                        (max_response_len,),
+                        int(pad_token_id),
+                        dtype=base["responses"].dtype,
+                        device=base["responses"].device,
+                    )
+                )
+                aux_response_masks.append(
+                    torch.zeros((max_response_len,), dtype=base["response_mask"].dtype, device=base["response_mask"].device)
+                )
+                aux_feedback_weights.append(
+                    torch.zeros(max_response_len, dtype=torch.float32, device=base["responses"].device)
+                )
+                aux_error_weights.append(
+                    torch.zeros(max_response_len, dtype=torch.float32, device=base["responses"].device)
+                )
+                aux_theorem_weights.append(
+                    torch.zeros(max_response_len, dtype=torch.float32, device=base["responses"].device)
+                )
+                source_indices.append(0)
+
+        aux_responses_tensor = torch.stack(aux_responses, dim=0)
+        aux_response_mask = torch.stack(aux_response_masks, dim=0)
+        feedback_weights = torch.stack(aux_feedback_weights, dim=0)
+        error_weights = torch.stack(aux_error_weights, dim=0)
+        theorem_weights = torch.stack(aux_theorem_weights, dim=0)
+        combined_ce_weights = feedback_weights + theorem_weights
+
+        source_index = torch.tensor(source_indices, dtype=torch.long)
+        prompt_attention = base["attention_mask"].index_select(
+            0, source_index.to(base["attention_mask"].device)
+        )[:, :prompt_len]
+        aux_attention_mask = torch.cat([prompt_attention, aux_response_mask], dim=1)
+        aux_prompts = base["prompts"].index_select(0, source_index.to(base["prompts"].device))
+        aux_input_ids = torch.cat([aux_prompts, aux_responses_tensor], dim=1)
+        aux_position_ids = compute_position_id_with_mask(aux_attention_mask)
+        if base["position_ids"].dim() == 3:
+            aux_position_ids = base["position_ids"].index_select(0, source_index.to(base["position_ids"].device)).clone()
+
+        tensors = {}
+        for key, tensor in base.items():
+            if key == "prompts":
+                aux_tensor = tensor.index_select(0, source_index.to(tensor.device)).clone()
+            elif key == "responses":
+                aux_tensor = aux_responses_tensor
+            elif key == "input_ids":
+                aux_tensor = aux_input_ids
+            elif key == "attention_mask":
+                aux_tensor = aux_attention_mask
+            elif key == "position_ids":
+                aux_tensor = aux_position_ids
+            elif key == "response_mask":
+                aux_tensor = aux_response_mask
+            else:
+                aux_tensor = torch.zeros_like(tensor.index_select(0, source_index.to(tensor.device)))
+            tensors[key] = torch.cat([tensor, aux_tensor], dim=0)
+
+        tensors["ppo_response_mask"] = torch.cat(
+            [base["response_mask"], torch.zeros_like(aux_response_mask)], dim=0
+        )
+        tensors["feedback_loss_weights"] = torch.cat(
+            [torch.zeros((bsz, max_response_len), dtype=torch.float32, device=combined_ce_weights.device), combined_ce_weights],
+            dim=0,
+        )
+        tensors["error_feedback_loss_weights"] = torch.cat(
+            [torch.zeros((bsz, max_response_len), dtype=torch.float32, device=error_weights.device), error_weights], dim=0
+        )
+        tensors["theorem_statement_loss_weights"] = torch.cat(
+            [torch.zeros((bsz, max_response_len), dtype=torch.float32, device=theorem_weights.device), theorem_weights],
+            dim=0,
+        )
+
+        non_tensors = {
+            key: np.concatenate([value, np.asarray(value, dtype=object)[source_indices]], axis=0)
+            for key, value in batch.non_tensor_batch.items()
+        }
+        metrics["feedback/aux_rows"] = len(aux_responses)
+        metrics["feedback/canonical_aux_rows"] = feedback_aux_rows
+        metrics["feedback/theorem_statement_aux_rows"] = theorem_aux_rows
+        metrics["feedback/padding_aux_rows"] = padding_aux_rows
+        metrics["feedback/active_tokens"] = float((feedback_weights > 0).sum().item())
+        metrics["feedback/error_active_tokens"] = float((error_weights > 0).sum().item())
+        metrics["feedback/theorem_statement_active_tokens"] = float((theorem_weights > 0).sum().item())
+        metrics["feedback/avg_feedback_tokens"] = float((feedback_weights > 0).sum().item() / max(feedback_aux_rows, 1))
+        metrics["feedback/avg_error_feedback_tokens"] = float((error_weights > 0).sum().item() / max(feedback_aux_rows, 1))
+        metrics["feedback/avg_theorem_statement_tokens"] = float(
+            (theorem_weights > 0).sum().item() / max(theorem_aux_rows, 1)
+        )
+        metrics["feedback/truncated_targets"] = truncated_feedback_targets
+        metrics["feedback/theorem_statement_truncated_targets"] = truncated_theorem_targets
+        return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=deepcopy(batch.meta_info))
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -1395,6 +1810,7 @@ class RayPPOTrainer:
 
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+                        metrics.update(self._lean_reward_diagnostics(reward_tensor, reward_extra_infos_dict))
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -1463,7 +1879,27 @@ class RayPPOTrainer:
                         batch.batch["token_level_scores"] = reward_tensor
 
                         if reward_extra_infos_dict:
-                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+                            batch.non_tensor_batch.update(
+                                {k: _object_array_1d(v) for k, v in reward_extra_infos_dict.items()}
+                            )
+
+                        proof_action_mask = self._proof_action_response_mask(batch, metrics)
+                        if proof_action_mask is not None:
+                            batch.batch["ppo_response_mask"] = proof_action_mask
+
+                        valid_reward_mask = _lean_valid_reward_mask(
+                            reward_extra_infos_dict,
+                            reward_tensor.shape[0],
+                            reward_tensor.device,
+                        )
+                        if valid_reward_mask is not None:
+                            batch.batch["valid_reward_mask"] = valid_reward_mask
+                            row_mask = valid_reward_mask.to(batch.batch["response_mask"].dtype).unsqueeze(-1)
+                            base_ppo_mask = batch.batch.get("ppo_response_mask", batch.batch["response_mask"])
+                            batch.batch["ppo_response_mask"] = base_ppo_mask * row_mask
+                            metrics["lean/invalid_reward_masked_rate"] = (
+                                1.0 - valid_reward_mask.float().mean().detach().item()
+                            )
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
@@ -1515,7 +1951,8 @@ class RayPPOTrainer:
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
-                            actor_output = self._update_actor(batch)
+                            actor_batch = self._maybe_append_feedback_aux_batch(batch, metrics)
+                            actor_output = self._update_actor(actor_batch)
 
                         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                         esi_close_to_expiration = should_save_ckpt_esi(

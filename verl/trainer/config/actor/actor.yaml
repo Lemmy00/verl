@@ -75,6 +75,30 @@ policy_loss:
   # KL divergence penalty coefficient
   ppo_kl_coef: 0.1
 
+# Auxiliary CE loss over canonical Lean feedback blocks
+feedback_loss:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.workers.config.FeedbackLossConfig
+
+  # Whether to add the auxiliary feedback CE loss to the actor update
+  enabled: false
+
+  # Multiplier for the weighted feedback CE loss
+  lambda_coef: 1.0
+
+  # Per-token weight for ordinary canonical feedback spans
+  feedback_weight: 0.3
+
+  # Per-token weight for Lean error feedback spans
+  error_feedback_weight: 0.5
+
+  # Whether to add a low-weight CE target for the expected theorem statement
+  theorem_statement_enabled: true
+
+  # Per-token weight for expected theorem statement CE targets
+  theorem_statement_weight: 0.05
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 
@@ -258,4 +282,3 @@ router_replay:
   # File path to load recorded routing decisions for replay
   # Required when mode is 'replay'
   replay_file: null
-

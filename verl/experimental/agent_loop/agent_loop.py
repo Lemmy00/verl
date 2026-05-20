@@ -53,6 +53,12 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _object_array_1d(values):
+    arr = np.empty(len(values), dtype=object)
+    arr[:] = values
+    return arr
+
+
 def _hashable_reward_group_id(value, idx: int):
     if isinstance(value, np.generic):
         value = value.item()
@@ -98,16 +104,9 @@ def _impute_invalid_lean_scores(
         bool(info.get("lean_valid_reward", True)) and np.isfinite(scores[idx])
         for idx, info in enumerate(reward_extra_infos)
     ]
-    grouped_indices = {}
-    for idx, group_id in enumerate(_reward_group_ids(input_non_tensor_batch, len(scores))):
-        grouped_indices.setdefault(_hashable_reward_group_id(group_id, idx), []).append(idx)
-
-    for indices in grouped_indices.values():
-        valid_scores = [scores[idx] for idx in indices if valid_flags[idx]]
-        replacement = float(np.mean(valid_scores)) if valid_scores else 0.0
-        for idx in indices:
-            if not valid_flags[idx]:
-                scores[idx] = replacement
+    for idx, is_valid in enumerate(valid_flags):
+        if not is_valid:
+            scores[idx] = 0.0
 
     for idx, info in enumerate(reward_extra_infos):
         info["lean_score_for_loss"] = scores[idx]
@@ -844,7 +843,7 @@ class AgentLoopWorker:
         # add reward_extra_info to non_tensor_batch
         reward_extra_keys = list(reward_extra_infos[0].keys())
         for key in reward_extra_keys:
-            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
+            non_tensor_batch[key] = _object_array_1d([info[key] for info in reward_extra_infos])
 
         # Add multi_modal_inputs to non_tensor_batch if any samples have them
         multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]

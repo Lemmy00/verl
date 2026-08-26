@@ -17,6 +17,7 @@ import logging
 import os
 import random
 from abc import ABC, abstractmethod
+from time import perf_counter, time_ns
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -186,6 +187,7 @@ class AgentLoopMetrics(BaseModel):
 
     generate_sequences: float = 0.0
     tool_calls: float = 0.0
+    reward_score_s: float = 0.0
     num_preempted: int = -1  # -1 means not available
 
 
@@ -675,15 +677,19 @@ class AgentLoopWorker:
 
         multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
         position_ids = self._compute_position_ids(input_ids, attention_mask, multi_modal_inputs)
-        await self._compute_score(
-            output,
-            prompts=prompt_output["input_ids"],
-            responses=response_output["input_ids"],
-            attention_mask=attention_mask,
-            input_ids=input_ids,
-            position_ids=position_ids,
-            kwargs=kwargs,
-        )
+        reward_started = perf_counter()
+        try:
+            await self._compute_score(
+                output,
+                prompts=prompt_output["input_ids"],
+                responses=response_output["input_ids"],
+                attention_mask=attention_mask,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                kwargs=kwargs,
+            )
+        finally:
+            output.metrics.reward_score_s = perf_counter() - reward_started
 
         return _InternalAgentLoopOutput(
             prompt_ids=prompt_output["input_ids"],
@@ -787,9 +793,20 @@ class AgentLoopWorker:
                 non_tensor_batch=non_tensor_batch,
             )
             selected_reward_loop_worker_handle = random.choice(self.reward_loop_worker_handles)
+            reward_request_started_ns = time_ns()
+            reward_remote_started = perf_counter()
             result = await selected_reward_loop_worker_handle.compute_score.remote(data)
+            reward_request_finished_ns = time_ns()
             output.reward_score = result["reward_score"]
-            output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
+            reward_extra_info = dict(result.get("reward_extra_info") or {})
+            reward_extra_info.update(
+                {
+                    "reward_request_started_unix_ns": reward_request_started_ns,
+                    "reward_request_finished_unix_ns": reward_request_finished_ns,
+                    "reward_remote_s": perf_counter() - reward_remote_started,
+                }
+            )
+            output.extra_fields["reward_extra_info"] = reward_extra_info
 
     def _postprocess(
         self,
@@ -1037,6 +1054,7 @@ class AgentLoopManager:
         timing = {}
         t_generate_sequences = np.array([metric["generate_sequences"] for chunk in metrics for metric in chunk])
         t_tool_calls = np.array([metric["tool_calls"] for chunk in metrics for metric in chunk])
+        t_reward_score = np.array([metric.get("reward_score_s", 0.0) for chunk in metrics for metric in chunk])
         num_preempted = np.array([metric["num_preempted"] for chunk in metrics for metric in chunk])
         timing["agent_loop/num_preempted/min"] = num_preempted.min()
         timing["agent_loop/num_preempted/max"] = num_preempted.max()
@@ -1047,8 +1065,24 @@ class AgentLoopManager:
         timing["agent_loop/tool_calls/min"] = t_tool_calls.min()
         timing["agent_loop/tool_calls/max"] = t_tool_calls.max()
         timing["agent_loop/tool_calls/mean"] = t_tool_calls.mean()
+        timing["agent_loop/reward_score_s/min"] = t_reward_score.min()
+        timing["agent_loop/reward_score_s/max"] = t_reward_score.max()
+        timing["agent_loop/reward_score_s/mean"] = t_reward_score.mean()
 
-        # batch sequence generation is bounded by the slowest sample
+        # The streamed reward runs inside each sample's generation coroutine.
+        # Report both the slowest token producer and the actual slowest completed
+        # trajectory so Lean tail latency is no longer hidden in timing_s/gen.
+        sample_completion = t_generate_sequences + t_tool_calls + t_reward_score
+        timing["agent_loop/sample_completion/min"] = sample_completion.min()
+        timing["agent_loop/sample_completion/max"] = sample_completion.max()
+        timing["agent_loop/sample_completion/mean"] = sample_completion.mean()
+        timing["agent_loop/lean_tail_after_generation_max"] = max(
+            0.0,
+            sample_completion.max()
+            - (t_generate_sequences + t_tool_calls).max(),
+        )
+
+        # Retain the historical slowest-generation fields for compatibility.
         slowest = np.argmax(t_generate_sequences + t_tool_calls)
         attention_mask = output.batch["attention_mask"][slowest]
         prompt_length = output.batch["prompts"].shape[1]
@@ -1057,6 +1091,14 @@ class AgentLoopManager:
         timing["agent_loop/slowest/prompt_length"] = attention_mask[:prompt_length].sum().item()
         timing["agent_loop/slowest/response_length"] = attention_mask[prompt_length:].sum().item()
         timing["agent_loop/slowest/num_preempted"] = num_preempted[slowest]
+
+        slowest_completion = np.argmax(sample_completion)
+        completion_mask = output.batch["attention_mask"][slowest_completion]
+        timing["agent_loop/critical_path/generate_sequences"] = t_generate_sequences[slowest_completion]
+        timing["agent_loop/critical_path/tool_calls"] = t_tool_calls[slowest_completion]
+        timing["agent_loop/critical_path/reward_score_s"] = t_reward_score[slowest_completion]
+        timing["agent_loop/critical_path/prompt_length"] = completion_mask[:prompt_length].sum().item()
+        timing["agent_loop/critical_path/response_length"] = completion_mask[prompt_length:].sum().item()
 
         return timing
 

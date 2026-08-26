@@ -514,6 +514,17 @@ class RayPPOTrainer:
         if not reward_extra_infos_dict:
             return metrics
 
+        def numeric_values(key: str) -> list[float]:
+            values = []
+            for value in reward_extra_infos_dict.get(key, []):
+                try:
+                    number = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(number):
+                    values.append(number)
+            return values
+
         statuses = list(reward_extra_infos_dict.get("lean_status", []))
         if statuses:
             total = max(len(statuses), 1)
@@ -523,6 +534,18 @@ class RayPPOTrainer:
             metrics["lean/valid_proof_rate"] = statuses.count("verified") / total
             metrics["lean/infra_failure_rate"] = sum("infra" in str(status) for status in statuses) / total
 
+        error_kinds = [
+            str(value)
+            for value in reward_extra_infos_dict.get("lean_error_kind", [])
+            if str(value)
+        ]
+        if error_kinds:
+            total = max(len(statuses), len(error_kinds), 1)
+            for kind in set(error_kinds):
+                count = error_kinds.count(kind)
+                metrics[f"lean/error_kind/{kind}"] = count
+                metrics[f"lean/error_kind_rate/{kind}"] = count / total
+
         valid_flags = reward_extra_infos_dict.get("lean_valid_reward", None)
         if valid_flags is not None and len(valid_flags) > 0:
             metrics["lean/valid_reward_rate"] = float(np.mean([_truthy(v) for v in valid_flags]))
@@ -530,6 +553,64 @@ class RayPPOTrainer:
         canonical_flags = reward_extra_infos_dict.get("has_canonical_feedback", None)
         if canonical_flags is not None and len(canonical_flags) > 0:
             metrics["feedback/canonical_success_rate"] = float(np.mean([_truthy(v) for v in canonical_flags]))
+
+        for key, metric_name in (
+            ("lean_timeouts", "timeout"),
+            ("lean_candidate_timeouts", "candidate_timeout"),
+            ("lean_feedback_fallback_timeouts", "feedback_fallback_timeout"),
+            ("lean_setup_timeouts", "setup_timeout"),
+            ("lean_replay_timeouts", "replay_timeout"),
+            ("lean_replay_failures", "replay_failure"),
+            ("lean_retries", "retry"),
+            ("lean_command_attempts", "command_attempt"),
+        ):
+            values = numeric_values(key)
+            if values:
+                metrics[f"lean/{metric_name}_events"] = float(sum(values))
+                metrics[f"lean/{metric_name}_per_rollout"] = float(np.mean(values))
+                metrics[f"lean/{metric_name}_rollout_rate"] = float(
+                    np.mean([value > 0 for value in values])
+                )
+
+        for key, metric_name in (
+            ("lean_context_s", "context_wait_s"),
+            ("lean_verify_s", "verify_wall_s"),
+            ("lean_total_s", "total_wall_s"),
+            ("reward_remote_s", "reward_remote_s"),
+        ):
+            values = numeric_values(key)
+            if values:
+                metrics[f"lean/{metric_name}/mean"] = float(np.mean(values))
+                metrics[f"lean/{metric_name}/p50"] = float(np.percentile(values, 50))
+                metrics[f"lean/{metric_name}/p90"] = float(np.percentile(values, 90))
+                metrics[f"lean/{metric_name}/max"] = float(max(values))
+
+        for key, metric_name in (
+            ("lean_cache_hit", "problem_cache_hit_rate"),
+            ("lean_context_cache_hit", "context_cache_or_env_hit_rate"),
+        ):
+            values = reward_extra_infos_dict.get(key, None)
+            if values is not None and len(values) > 0:
+                metrics[f"lean/{metric_name}"] = float(
+                    np.mean([_truthy(value) for value in values])
+                )
+
+        executor_workers = numeric_values("lean_executor_workers")
+        if executor_workers:
+            metrics["lean/executor_workers"] = float(max(executor_workers))
+
+        for key, metric_name in (
+            ("lean_warmup_attempts_total", "warmup_attempts_total"),
+            ("lean_warmup_failures_total", "warmup_failures_total"),
+            ("lean_restart_warmups_total", "restart_warmups_total"),
+            (
+                "lean_restart_warmup_failures_total",
+                "restart_warmup_failures_total",
+            ),
+        ):
+            values = numeric_values(key)
+            if values:
+                metrics[f"lean/{metric_name}"] = float(max(values))
 
         loss_reward_mean = reward_tensor.sum(dim=-1).float().mean().detach().item()
         metrics["lean/loss_reward_mean"] = loss_reward_mean

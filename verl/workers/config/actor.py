@@ -28,6 +28,7 @@ from .optimizer import OptimizerConfig
 __all__ = [
     "PolicyLossConfig",
     "FeedbackLossConfig",
+    "SelfDistillationConfig",
     "RouterReplayConfig",
     "ActorConfig",
     "FSDPActorConfig",
@@ -66,6 +67,83 @@ class RouterReplayConfig(BaseConfig):
 
 
 @dataclass
+class SelfDistillationConfig(BaseConfig):
+    """Configuration for SDPO self-distillation."""
+
+    full_logit_distillation: bool = True
+    loss_coef: float = 1.0
+    alpha: float = 0.0
+    success_reward_threshold: float = 1.0
+    distillation_topk: Optional[int] = 20
+    distillation_add_tail: bool = True
+    distillation_tail_epsilon: float = 1e-4
+    skip_clipped_responses: bool = False
+    max_target_response_len: Optional[int] = None
+    max_reprompt_len: int = 4096
+    # Budget the whole teacher sequence (reprompt + response) rather than the
+    # reprompt alone; None keeps the legacy reprompt-only behaviour. Over-budget
+    # reprompts are elided in the middle, preserving head and tail.
+    max_teacher_total_len: Optional[int] = None
+    min_reprompt_len: int = 1024
+    reprompt_truncation: str = "right"
+    dont_reprompt_on_self_success: bool = False
+    remove_thinking_from_demonstration: bool = False
+    is_clip: Optional[float] = None
+    reprompt_template: str = "{prompt}{solution}{feedback}\n\nCorrectly solve the original question.\n"
+    solution_template: str = "\nCorrect solution:\n\n{successful_previous_attempt}\n\n"
+    feedback_template: str = (
+        "\nThe following is Lean feedback from your unsuccessful earlier attempt:\n\n"
+        "{feedback_raw}\n\n"
+    )
+    environment_feedback_format: str = "sft_proof_repair"
+    proof_repair_template: str = (
+        "{prompt}\n\n"
+        "Previous failed attempt:\n\n"
+        "```lean4\n{failed_attempt}\n```\n\n"
+        "Use it to improve your solution.\n"
+    )
+    use_fallback_environment_feedback: bool = False
+    include_environment_feedback: bool = True
+    environment_feedback_only_without_solution: bool = True
+
+    def __post_init__(self):
+        if self.loss_coef < 0.0:
+            raise ValueError(f"self_distillation.loss_coef must be non-negative, got {self.loss_coef}")
+        if not 0.0 <= self.alpha <= 1.0:
+            raise ValueError(f"self_distillation.alpha must be in [0, 1], got {self.alpha}")
+        if not 0.0 < self.distillation_tail_epsilon < 1.0:
+            raise ValueError(
+                "self_distillation.distillation_tail_epsilon must be in (0, 1), "
+                f"got {self.distillation_tail_epsilon}"
+            )
+        if self.max_teacher_total_len is not None and self.max_teacher_total_len <= 0:
+            raise ValueError(
+                "self_distillation.max_teacher_total_len must be a positive integer or null, "
+                f"got {self.max_teacher_total_len}"
+            )
+        if self.min_reprompt_len <= 0:
+            raise ValueError(
+                f"self_distillation.min_reprompt_len must be a positive integer, got {self.min_reprompt_len}"
+            )
+        if self.max_target_response_len is not None and self.max_target_response_len <= 0:
+            raise ValueError(
+                "self_distillation.max_target_response_len must be a positive integer or null, "
+                f"got {self.max_target_response_len}"
+            )
+        if self.environment_feedback_format not in {"generic", "sft_proof_repair"}:
+            raise ValueError(
+                "self_distillation.environment_feedback_format must be one of "
+                f"{{'generic', 'sft_proof_repair'}}, got {self.environment_feedback_format!r}"
+            )
+        if self.distillation_topk is not None and self.distillation_topk <= 0:
+            raise ValueError(
+                f"self_distillation.distillation_topk must be a positive integer, got {self.distillation_topk}"
+            )
+        if self.is_clip is not None and self.is_clip <= 0:
+            raise ValueError(f"self_distillation.is_clip must be positive, got {self.is_clip}")
+
+
+@dataclass
 class PolicyLossConfig(BaseConfig):
     """Configuration for policy loss computation.
 
@@ -98,6 +176,25 @@ class FeedbackLossConfig(BaseConfig):
     error_feedback_weight: float = 0.5
     theorem_statement_enabled: bool = True
     theorem_statement_weight: float = 0.05
+    # Surface form of the CE target. The auxiliary row must present the annotated
+    # proof the same way the policy emits it at rollout time, otherwise feedback
+    # prediction is trained in a context the policy never occupies -- and the
+    # objective quietly pushes it to drop the fence its own reward path requires.
+    # Must contain "{code}" exactly once; substitution is literal (Lean code is
+    # full of braces, so str.format cannot be used).
+    target_template: str = (
+        " Here is the complete Lean 4 proof annotated with Lean 4 compiler feedback blocks:"
+        "\n\n```lean4\n{code}\n```\n"
+    )
+
+    def __post_init__(self):
+        if self.target_template.count("{code}") != 1:
+            raise ValueError(
+                "feedback_loss.target_template must contain '{code}' exactly once, got "
+                f"{self.target_template!r}"
+            )
+        if self.lambda_coef < 0.0:
+            raise ValueError(f"feedback_loss.lambda_coef must be non-negative, got {self.lambda_coef}")
 
 
 @dataclass
@@ -161,6 +258,7 @@ class ActorConfig(BaseConfig):
     freeze_vision_tower: bool = False
     policy_loss: PolicyLossConfig = field(default_factory=PolicyLossConfig)
     feedback_loss: FeedbackLossConfig = field(default_factory=FeedbackLossConfig)
+    self_distillation: SelfDistillationConfig = field(default_factory=SelfDistillationConfig)
     clip_ratio_c: float = 3.0
     loss_agg_mode: str = "token-mean"
     loss_scale_factor: Optional[int] = None

@@ -603,6 +603,9 @@ class AlgoConfig(BaseConfig):
     lam: float = 1.0
     adv_estimator: str = "gae"
     norm_adv_by_std_in_grpo: bool = True
+    # Lower bound on the GRPO group std. 0.0 disables it. See
+    # compute_grpo_outcome_advantage for why 1/sqrt(G) is the principled value.
+    grpo_adv_std_floor: float = 0.0
     use_kl_in_reward: bool = False
     kl_penalty: str = "kl"
     kl_ctrl: KLControlConfig = field(default_factory=KLControlConfig)

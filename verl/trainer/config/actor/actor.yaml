@@ -57,7 +57,7 @@ policy_loss:
   # # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: verl.workers.config.PolicyLossConfig
 
-  # Loss function mode: vanilla / clip-cov / kl-cov /gpg from https://arxiv.org/abs/2505.22617
+  # Loss function mode: vanilla / clip-cov / kl-cov / gpg / sdpo
   loss_mode: "vanilla"
 
   # Ratio of tokens to be clipped for clip-cov loss
@@ -98,6 +98,87 @@ feedback_loss:
 
   # Per-token weight for expected theorem statement CE targets
   theorem_statement_weight: 0.05
+
+  # Surface form of the CE target; must contain "{code}" exactly once.
+  target_template: " Here is the complete Lean 4 proof annotated with Lean 4 compiler feedback blocks:\n\n```lean4\n{code}\n```\n"
+
+# SDPO self-distillation config
+self_distillation:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.workers.config.SelfDistillationConfig
+
+  # Whether to use logit-level distillation instead of sampled-token reverse KL
+  full_logit_distillation: true
+
+  # Multiplier on the SDPO loss before adding actor KL regularization
+  loss_coef: 1.0
+
+  # KL interpolation coefficient: 0.0 forward KL, 1.0 reverse KL
+  alpha: 0.0
+
+  # Minimum sequence reward treated as a successful rollout
+  success_reward_threshold: 1.0
+
+  # Number of student top-k logits to distill; null uses full vocabulary
+  distillation_topk: 20
+
+  # Whether to add a probability tail bucket for top-k distillation
+  distillation_add_tail: true
+
+  # Minimum probability mass assigned to the top-k tail bucket
+  distillation_tail_epsilon: 0.0001
+
+  # Whether to skip rollouts that consumed the full response budget as SDPO targets
+  skip_clipped_responses: false
+
+  # Optional maximum rollout response tokens allowed as an SDPO target
+  max_target_response_len: null
+
+  # Maximum teacher reprompt tokens before appending the original response
+  max_reprompt_len: 4096
+
+  # Total teacher-sequence budget (reprompt + response). null = reprompt-only (legacy).
+  max_teacher_total_len: null
+
+  # Floor for the per-sample reprompt budget under max_teacher_total_len.
+  min_reprompt_len: 1024
+
+  # Truncation side for teacher reprompts
+  reprompt_truncation: right
+
+  # Whether successful samples should use another group solution instead of themselves
+  dont_reprompt_on_self_success: false
+
+  # Whether to strip <think>...</think> from successful demonstrations
+  remove_thinking_from_demonstration: false
+
+  # Clip value for distillation importance sampling; null disables clipping
+  is_clip: null
+
+  # Teacher prompt template with {prompt}, {solution}, and {feedback}
+  reprompt_template: "{prompt}{solution}{feedback}\n\nCorrectly solve the original question.\n"
+
+  # Successful rollout section template
+  solution_template: "\nCorrect solution:\n\n{successful_previous_attempt}\n\n"
+
+  # Environment feedback section template
+  feedback_template: "\nThe following is Lean feedback from your unsuccessful earlier attempt:\n\n{feedback_raw}\n\n"
+
+  # Environment feedback prompt format. "sft_proof_repair" matches the Lean SFT repair rows.
+  environment_feedback_format: sft_proof_repair
+
+  # SFT proof-repair prompt template with the annotated failed attempt in a Lean block.
+  proof_repair_template: "{prompt}\n\nPrevious failed attempt:\n\n```lean4\n{failed_attempt}\n```\n\nUse it to improve your solution.\n"
+
+  # Whether to fall back to status/plain attempted-code feedback when canonical annotations are missing
+  use_fallback_environment_feedback: false
+
+  # Whether to include Lean reward feedback in teacher reprompts
+  include_environment_feedback: true
+
+  # Whether to omit environment feedback when a successful solution is available
+  environment_feedback_only_without_solution: true
 
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0

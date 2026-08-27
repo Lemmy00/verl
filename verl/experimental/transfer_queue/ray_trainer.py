@@ -201,6 +201,11 @@ def compute_advantage(
             response_mask=grpo_calculation_mask,
             index=data.non_tensor_batch["uid"],
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            # Both must be forwarded, as in trainer/ppo/ray_trainer.py: without config
+            # the group-std floor silently stays 0.0, and without valid_reward_mask
+            # invalid-reward rows would re-enter the group statistics.
+            valid_reward_mask=data.batch.get("valid_reward_mask", None),
+            config=config,
         )
     else:
         # handle all other adv estimator type other than GAE and GRPO

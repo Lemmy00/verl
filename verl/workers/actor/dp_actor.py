@@ -19,6 +19,7 @@ Single Process Actor
 
 import logging
 import os
+from typing import Optional
 
 import torch
 from torch import nn
@@ -27,7 +28,7 @@ from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import agg_loss, compute_self_distillation_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -36,7 +37,7 @@ from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
 from verl.utils.torch_dtypes import PrecisionType
 from verl.utils.torch_functional import logprobs_from_logits
-from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
+from verl.utils.ulysses import gather_outputs_and_unpad, slice_input_tensor, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
 
@@ -60,6 +61,7 @@ class DataParallelPPOActor(BasePPOActor):
         super().__init__(config)
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
+        self.teacher_module: Optional[nn.Module] = None
         role = "Ref" if actor_optimizer is None else "Actor"
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
@@ -110,34 +112,65 @@ class DataParallelPPOActor(BasePPOActor):
                 f"{self.use_fused_kernels=} or {self.use_prefix_grouper=} for now."
             )
 
+    @staticmethod
+    def _has_non_empty_multi_modal_inputs(multi_modal_inputs) -> bool:
+        if multi_modal_inputs is None:
+            return False
+        for inputs in multi_modal_inputs:
+            if inputs is None:
+                continue
+            inputs = getattr(inputs, "data", inputs)
+            if isinstance(inputs, dict):
+                if not inputs:
+                    continue
+                for value in inputs.values():
+                    if value is None:
+                        continue
+                    if isinstance(value, torch.Tensor) and value.numel() == 0:
+                        continue
+                    return True
+            else:
+                return True
+        return False
+
     def _forward_micro_batch(
-        self, micro_batch: dict[str, torch.Tensor], temperature: float, calculate_entropy: bool = False
+        self,
+        micro_batch: dict[str, torch.Tensor],
+        temperature: float,
+        calculate_entropy: bool = False,
+        return_all_logps: bool = False,
+        distill_topk: Optional[int] = None,
+        topk_indices: Optional[torch.Tensor] = None,
+        module: Optional[nn.Module] = None,
     ) -> dict[str, torch.Tensor]:
         """
-        Returns:
-            dict[str, torch.Tensor]:
-                log_probs: (bs, response_len)
-                if calculate_entropy is True:
-                    entropys: (bs, response_len)
-                if calculate_sum_pi_squared is False:
-                    sum_pi_squared: (bs, response_len)
+        Returns log-probs for response tokens, optionally with top-k/full log-probs
+        needed by SDPO logit distillation.
         """
         calculate_sum_pi_squared = self.config.get("calculate_sum_pi_squared", False)
         sum_pi_squared_checkpointing = self.config.get("sum_pi_squared_checkpointing", False)
-        # PrefixGrouper path for shared-prefix optimization
+        use_topk = distill_topk is not None or topk_indices is not None
+        compute_all_logps = return_all_logps and not use_topk
+        return_topk_indices = use_topk and topk_indices is None
+        if (return_all_logps or use_topk) and self.use_fused_kernels:
+            raise ValueError("SDPO logit distillation requires disabling fused kernels.")
+        model = module or self.actor_module
+
         if self.use_prefix_grouper:
             can_use_pg = (
                 not self.use_remove_padding
                 and not self.use_ulysses_sp
                 and not self.use_fused_kernels
                 and not self.use_dynamic_bsz
+                and not return_all_logps
+                and not use_topk
             )
             if can_use_pg and "response_mask" in micro_batch and "uid" in micro_batch:
                 from verl.trainer.ppo.prefix_grouper_utils import forward_micro_batch_with_prefix_grouper
 
                 return forward_micro_batch_with_prefix_grouper(
                     micro_batch=micro_batch,
-                    model=self.actor_module,
+                    model=model,
                     temperature=temperature,
                     calculate_entropy=calculate_entropy,
                     device_name=self.device_name,
@@ -158,22 +191,19 @@ class DataParallelPPOActor(BasePPOActor):
             attention_mask = micro_batch["attention_mask"]
             position_ids = micro_batch["position_ids"]
             entropy = None
-            if position_ids.dim() == 3:  # qwen2vl mrope
-                position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
+            if position_ids.dim() == 3:
+                position_ids = position_ids.transpose(0, 1)
 
             if self.use_remove_padding:
-                input_ids_rmpad, indices, cu_seqlens, *_ = unpad_input(
-                    input_ids.unsqueeze(-1), attention_mask
-                )  # input_ids_rmpad (total_nnz, ...)
-                input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
+                input_ids_rmpad, indices, cu_seqlens, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)
+                input_ids_rmpad = input_ids_rmpad.transpose(0, 1)
 
-                # unpad the position_ids to align the rotary
                 if position_ids.dim() == 3:
                     position_ids_rmpad = (
                         index_first_axis(rearrange(position_ids, "c b s ... -> (b s) c ..."), indices)
                         .transpose(0, 1)
                         .unsqueeze(1)
-                    )  # (4, bsz, seqlen) -> (4, 1, bsz * seqlen)
+                    )
                 else:
                     position_ids_rmpad = index_first_axis(
                         rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
@@ -206,16 +236,11 @@ class DataParallelPPOActor(BasePPOActor):
                         input_ids, attention_mask, position_ids, cu_seqlens, multi_modal_inputs
                     )
 
-                # for compute the log_prob
-                input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
+                input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)
 
-                # pad and slice the inputs if sp > 1
                 if self.use_ulysses_sp:
-                    is_vlm_model = hasattr(
-                        getattr(self.actor_module, "module", self.actor_module).config, "vision_config"
-                    )
+                    is_vlm_model = hasattr(getattr(model, "module", model).config, "vision_config")
                     if is_vlm_model:
-                        # vlm model's inputs will be sliced after embedding
                         input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad(
                             input_ids_rmpad,
                             position_ids_rmpad=position_ids_rmpad,
@@ -233,51 +258,69 @@ class DataParallelPPOActor(BasePPOActor):
                         sp_size=self.ulysses_sequence_parallel_size,
                     )
 
-                input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
+                input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)
 
-                # only pass input_ids and position_ids to enable flash_attn_varlen
                 extra_args = {}
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
-                output = self.actor_module(
+                output = model(
                     input_ids=input_ids_rmpad,
                     attention_mask=None,
                     position_ids=position_ids_rmpad,
                     **multi_modal_inputs,
                     use_cache=False,
                     **extra_args,
-                )  # prevent model thinks we are generating
+                )
 
                 if self.use_fused_kernels:
-                    log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
-                    entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
-
+                    log_probs = output.log_probs.squeeze(0)
+                    entropy_rmpad = output.entropy.squeeze(0)
                 else:
-                    logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+                    logits_rmpad = output.logits.squeeze(0)
                     logits_rmpad.div_(temperature)
+                    all_logps_rmpad = torch.log_softmax(logits_rmpad, dim=-1) if compute_all_logps else None
 
-                    # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
-                    inplace_backward = True
-                    if calculate_entropy:
-                        inplace_backward = False
+                    inplace_backward = not calculate_entropy
                     log_probs = logprobs_from_logits(
                         logits=logits_rmpad,
                         labels=input_ids_rmpad_rolled,
                         inplace_backward=inplace_backward,
                     )
 
-                    # compute entropy
                     if calculate_entropy:
-                        # ((total_nnz / sp) + pad)
                         entropy_rmpad = (
                             self.compute_entropy_from_logits(logits_rmpad)
                             if not self.config.entropy_checkpointing
                             else torch.utils.checkpoint.checkpoint(self.compute_entropy_from_logits, logits_rmpad)
                         )
 
-                    # Compute sum_pi_squared if requested (for optimal_token_baseline)
+                    if use_topk:
+                        if topk_indices is None:
+                            topk = min(int(distill_topk), logits_rmpad.shape[-1])
+                            topk_logits_rmpad, topk_indices_rmpad = torch.topk(logits_rmpad, topk, dim=-1)
+                        else:
+                            topk = topk_indices.size(-1)
+                            full_topk_indices = torch.zeros(
+                                batch_size,
+                                seqlen,
+                                topk,
+                                device=topk_indices.device,
+                                dtype=topk_indices.dtype,
+                            )
+                            full_topk_indices[:, -response_length - 1 : -1, :] = topk_indices
+                            topk_indices_rmpad = index_first_axis(
+                                rearrange(full_topk_indices, "b s k -> (b s) k"), indices
+                            )
+                            if self.use_ulysses_sp:
+                                topk_indices_rmpad = slice_input_tensor(
+                                    topk_indices_rmpad.unsqueeze(0), dim=1, padding=True
+                                ).squeeze(0)
+                            topk_logits_rmpad = torch.gather(logits_rmpad, dim=-1, index=topk_indices_rmpad)
+                        logsumexp_rmpad = torch.logsumexp(logits_rmpad, dim=-1, keepdim=True)
+                        topk_logps_rmpad = topk_logits_rmpad - logsumexp_rmpad
+
                     if calculate_sum_pi_squared:
                         sum_pi_squared_rmpad = (
                             self.calculate_sum_pi_squared_from_logits(logits_rmpad)
@@ -287,9 +330,7 @@ class DataParallelPPOActor(BasePPOActor):
                             )
                         )
 
-                # gather log_prob if sp > 1
                 if self.use_ulysses_sp:
-                    # gather and unpad for the ulysses sp
                     log_probs = gather_outputs_and_unpad(
                         log_probs,
                         gather_dim=0,
@@ -303,6 +344,20 @@ class DataParallelPPOActor(BasePPOActor):
                             unpad_dim=0,
                             padding_size=pad_size,
                         )
+                    if use_topk:
+                        topk_logps_rmpad = gather_outputs_and_unpad(
+                            topk_logps_rmpad,
+                            gather_dim=0,
+                            unpad_dim=0,
+                            padding_size=pad_size,
+                        )
+                        if return_topk_indices:
+                            topk_indices_rmpad = gather_outputs_and_unpad(
+                                topk_indices_rmpad,
+                                gather_dim=0,
+                                unpad_dim=0,
+                                padding_size=pad_size,
+                            )
                     if calculate_sum_pi_squared:
                         sum_pi_squared_rmpad = gather_outputs_and_unpad(
                             sum_pi_squared_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size
@@ -312,8 +367,13 @@ class DataParallelPPOActor(BasePPOActor):
                     log_probs = log_probs[:0]
                     if calculate_entropy:
                         entropy_rmpad = entropy_rmpad[:0]
+                    if compute_all_logps:
+                        all_logps_rmpad = all_logps_rmpad[:0]
+                    if use_topk:
+                        topk_logps_rmpad = topk_logps_rmpad[:0]
+                        if return_topk_indices:
+                            topk_indices_rmpad = topk_indices_rmpad[:0]
 
-                # pad back to (bsz, seqlen)
                 if calculate_entropy:
                     full_entropy = pad_input(
                         hidden_states=entropy_rmpad.unsqueeze(-1),
@@ -328,6 +388,27 @@ class DataParallelPPOActor(BasePPOActor):
                         batch=batch_size,
                         seqlen=seqlen,
                     )
+                if compute_all_logps:
+                    full_all_logps = pad_input(
+                        hidden_states=all_logps_rmpad,
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+                if use_topk:
+                    full_topk_logps = pad_input(
+                        hidden_states=topk_logps_rmpad,
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+                    if return_topk_indices:
+                        full_topk_indices = pad_input(
+                            hidden_states=topk_indices_rmpad,
+                            indices=indices,
+                            batch=batch_size,
+                            seqlen=seqlen,
+                        )
                 full_log_probs = pad_input(
                     hidden_states=log_probs.unsqueeze(-1),
                     indices=indices,
@@ -335,45 +416,56 @@ class DataParallelPPOActor(BasePPOActor):
                     seqlen=seqlen,
                 )
 
-                # only return response part:
                 if calculate_entropy:
-                    entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
+                    entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]
                 if calculate_sum_pi_squared:
-                    # (bsz, response_length)
                     sum_pi_squared = full_sum_pi_squared.squeeze(-1)[:, -response_length - 1 : -1]
-                log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
+                log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]
+                if compute_all_logps:
+                    all_logps = full_all_logps[:, -response_length - 1 : -1, :]
+                if use_topk:
+                    topk_logps = full_topk_logps[:, -response_length - 1 : -1, :]
+                    if return_topk_indices:
+                        topk_indices = full_topk_indices[:, -response_length - 1 : -1, :]
 
-            else:  # not using rmpad and no ulysses sp
+            else:
                 extra_args = {}
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
-                output = self.actor_module(
+                output = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     **multi_modal_inputs,
                     use_cache=False,
                     **extra_args,
-                )  # prevent model thinks we are generating
+                )
 
                 if self.use_fused_kernels:
                     log_probs = output.log_probs[:, -response_length - 1 : -1]
-                    entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
-
+                    entropy = output.entropy[:, -response_length - 1 : -1]
                 else:
                     logits = output.logits
-
                     logits.div_(temperature)
-                    logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+                    logits = logits[:, -response_length - 1 : -1, :]
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
+                    if compute_all_logps:
+                        all_logps = torch.log_softmax(logits, dim=-1)
+                    if use_topk:
+                        if topk_indices is None:
+                            topk = min(int(distill_topk), logits.size(-1))
+                            topk_logits, topk_indices = torch.topk(logits, topk, dim=-1)
+                        else:
+                            topk_logits = torch.gather(logits, dim=-1, index=topk_indices)
+                        logsumexp = torch.logsumexp(logits, dim=-1, keepdim=True)
+                        topk_logps = topk_logits - logsumexp
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
-                            entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
+                            entropy = verl_F.entropy_from_logits(logits)
                         else:
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
-                    # Compute sum_pi_squared if requested (for optimal_token_baseline)
                     if calculate_sum_pi_squared:
                         sum_pi_squared = (
                             self.calculate_sum_pi_squared_from_logits(logits)
@@ -386,6 +478,12 @@ class DataParallelPPOActor(BasePPOActor):
                 outputs["entropys"] = entropy
             if calculate_sum_pi_squared:
                 outputs["sum_pi_squared"] = sum_pi_squared
+            if compute_all_logps:
+                outputs["all_logps"] = all_logps
+            if use_topk:
+                outputs["topk_logps"] = topk_logps
+                if return_topk_indices:
+                    outputs["topk_indices"] = topk_indices
             return outputs
 
     def _optimizer_step(self):
@@ -445,7 +543,7 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
         pad_token_id = data.meta_info.get("pad_token_id", 0)
-        has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
+        has_multi_modal_inputs = self._has_non_empty_multi_modal_inputs(data.non_tensor_batch.get("multi_modal_inputs"))
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
@@ -505,6 +603,18 @@ class DataParallelPPOActor(BasePPOActor):
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         pad_token_id = data.meta_info.get("pad_token_id", 0)
+        loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+        self_distillation_enabled = loss_mode == "sdpo"
+        self_distillation_cfg = getattr(self.config, "self_distillation", None)
+        if self_distillation_enabled:
+            self_distillation_required_keys = {
+                "teacher_input_ids",
+                "teacher_attention_mask",
+                "teacher_position_ids",
+                "self_distillation_mask",
+            }
+            missing = self_distillation_required_keys - set(data.batch.keys())
+            assert not missing, f"Missing required SDPO keys: {missing}"
 
         select_keys = [
             "responses",
@@ -527,6 +637,8 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("prompts")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
+        if self_distillation_enabled:
+            select_keys.extend(list(self_distillation_required_keys))
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
@@ -535,7 +647,7 @@ class DataParallelPPOActor(BasePPOActor):
         if "rollout_log_probs" in data.batch.keys():
             select_keys.append("rollout_log_probs")
 
-        has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
+        has_multi_modal_inputs = self._has_non_empty_multi_modal_inputs(data.non_tensor_batch.get("multi_modal_inputs"))
         non_tensor_select_keys = []
         if has_multi_modal_inputs:
             non_tensor_select_keys.append("multi_modal_inputs")
@@ -560,10 +672,13 @@ class DataParallelPPOActor(BasePPOActor):
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
                 else:
-                    self.gradient_accumulation = (
-                        self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
-                    )
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+                    # Normalise by the micro-batches this optimizer step actually holds.
+                    # The config formula assumes every mini-batch is full, which stops
+                    # being true as soon as the row count is not a multiple of
+                    # ppo_mini_batch_size -- e.g. once feedback aux rows are appended --
+                    # leaving the short tail step scaled by the wrong factor.
+                    self.gradient_accumulation = max(len(micro_batches), 1)
 
                 self.actor_optimizer.zero_grad()
 
@@ -580,18 +695,41 @@ class DataParallelPPOActor(BasePPOActor):
                     loss_agg_mode = self.config.loss_agg_mode
 
                     calculate_entropy = self.config.calculate_entropy or (entropy_coeff != 0)
+                    self_distillation_mask = (
+                        model_inputs.get("self_distillation_mask") if self_distillation_enabled else None
+                    )
+                    if self_distillation_enabled:
+                        assert not has_multi_modal_inputs, "Multi-modal inputs are not supported for SDPO distillation"
 
                     if self.config.use_dynamic_bsz:
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
 
+                    return_all_logps = (
+                        self_distillation_enabled
+                        and self_distillation_cfg.full_logit_distillation
+                        and not self_distillation_cfg.distillation_topk
+                    )
+                    distill_topk = (
+                        self_distillation_cfg.distillation_topk
+                        if self_distillation_enabled and self_distillation_cfg.full_logit_distillation
+                        else None
+                    )
+
                     # all return: (bsz, response_length)
                     outputs = self._forward_micro_batch(
-                        model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                        model_inputs,
+                        temperature=temperature,
+                        calculate_entropy=calculate_entropy,
+                        return_all_logps=return_all_logps,
+                        distill_topk=distill_topk,
                     )
                     log_prob = outputs["log_probs"]
                     entropy = outputs["entropys"] if calculate_entropy else None
+                    student_all_logps = outputs.get("all_logps") if return_all_logps else None
+                    student_topk_logps = outputs.get("topk_logps") if distill_topk else None
+                    student_topk_indices = outputs.get("topk_indices") if distill_topk else None
 
                     # for fully_async_policy
                     if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
@@ -602,19 +740,52 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             old_log_prob = model_inputs["old_log_probs"]
 
-                    loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
 
                     # Extract pre-computed rollout correction weights if present
                     # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                     rollout_is_weights = model_inputs.get("rollout_is_weights", None)
 
-                    # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
-                    # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
-                    policy_loss_fn = get_policy_loss_fn(loss_mode)
-
-                    # Compute policy loss (any function is expected to return 2 values)
-                    if ppo_response_mask.any():
+                    if self_distillation_enabled:
+                        teacher_inputs = {
+                            "responses": model_inputs["responses"],
+                            "input_ids": model_inputs["teacher_input_ids"],
+                            "attention_mask": model_inputs["teacher_attention_mask"],
+                            "position_ids": model_inputs["teacher_position_ids"],
+                        }
+                        with torch.no_grad():
+                            teacher_outputs = self._forward_micro_batch(
+                                teacher_inputs,
+                                temperature=temperature,
+                                calculate_entropy=False,
+                                return_all_logps=return_all_logps,
+                                distill_topk=distill_topk,
+                                topk_indices=student_topk_indices,
+                                module=self.teacher_module or self.actor_module,
+                            )
+                        pg_loss, pg_metrics = compute_self_distillation_loss(
+                            student_log_probs=log_prob,
+                            teacher_log_probs=teacher_outputs["log_probs"],
+                            response_mask=ppo_response_mask,
+                            self_distillation_config=self_distillation_cfg,
+                            old_log_probs=old_log_prob,
+                            student_all_log_probs=student_all_logps,
+                            teacher_all_log_probs=teacher_outputs.get("all_logps") if return_all_logps else None,
+                            student_topk_log_probs=student_topk_logps,
+                            teacher_topk_log_probs=teacher_outputs.get("topk_logps") if distill_topk else None,
+                            self_distillation_mask=self_distillation_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            rollout_is_weights=rollout_is_weights,
+                        )
+                        pg_metrics["self_distillation/empty_target_batch"] = (
+                            float(self_distillation_mask.sum().detach().item()) == 0.0
+                            if self_distillation_mask is not None
+                            else False
+                        )
+                    elif ppo_response_mask.any():
+                        # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
+                        # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
+                        policy_loss_fn = get_policy_loss_fn(loss_mode)
                         pg_loss, pg_metrics = policy_loss_fn(
                             old_log_prob=old_log_prob,
                             log_prob=log_prob,
@@ -683,23 +854,32 @@ class DataParallelPPOActor(BasePPOActor):
                         feedback_weight_sum = feedback_weights.sum()
                         feedback_loss = (ce * feedback_weights).sum() / torch.clamp(feedback_weight_sum, min=1.0)
                         policy_loss = policy_loss + feedback_lambda * feedback_loss
-                        micro_batch_metrics["actor/feedback_ce_loss"] = feedback_loss.detach().item()
                         micro_batch_metrics["actor/feedback_lambda"] = feedback_lambda
-                        micro_batch_metrics["actor/feedback_aux_loss"] = (feedback_lambda * feedback_loss).detach().item()
-                        micro_batch_metrics["actor/feedback_active_tokens"] = (
-                            (feedback_weights > 0).sum().detach().item()
-                        )
-                        micro_batch_metrics["actor/feedback_weight_sum"] = feedback_weight_sum.detach().item()
+                        # Only report CE from micro-batches that actually carry feedback
+                        # tokens. Averaging in the zeros from ordinary rollout rows made the
+                        # logged CE under-read the true value by roughly 2x.
+                        if feedback_weight_sum > 0:
+                            micro_batch_metrics["actor/feedback_ce_loss"] = feedback_loss.detach().item()
+                            micro_batch_metrics["actor/feedback_aux_loss"] = (
+                                feedback_lambda * feedback_loss
+                            ).detach().item()
+                            micro_batch_metrics["actor/feedback_active_tokens"] = (
+                                (feedback_weights > 0).sum().detach().item()
+                            )
+                            micro_batch_metrics["actor/feedback_weight_sum"] = feedback_weight_sum.detach().item()
                         error_weights = model_inputs.get("error_feedback_loss_weights", None)
                         if error_weights is not None:
                             error_weights = error_weights.to(device=log_prob.device, dtype=log_prob.dtype)
                             error_weight_sum = error_weights.sum()
                             error_loss = (ce * error_weights).sum() / torch.clamp(error_weight_sum, min=1.0)
-                            micro_batch_metrics["actor/error_feedback_ce_loss"] = error_loss.detach().item()
-                            micro_batch_metrics["actor/error_feedback_active_tokens"] = (
-                                (error_weights > 0).sum().detach().item()
-                            )
-                            micro_batch_metrics["actor/error_feedback_weight_sum"] = error_weight_sum.detach().item()
+                            if error_weight_sum > 0:
+                                micro_batch_metrics["actor/error_feedback_ce_loss"] = error_loss.detach().item()
+                                micro_batch_metrics["actor/error_feedback_active_tokens"] = (
+                                    (error_weights > 0).sum().detach().item()
+                                )
+                                micro_batch_metrics["actor/error_feedback_weight_sum"] = (
+                                    error_weight_sum.detach().item()
+                                )
                         theorem_statement_weights = model_inputs.get("theorem_statement_loss_weights", None)
                         if theorem_statement_weights is not None:
                             theorem_statement_weights = theorem_statement_weights.to(
@@ -709,11 +889,14 @@ class DataParallelPPOActor(BasePPOActor):
                             theorem_loss = (ce * theorem_statement_weights).sum() / torch.clamp(
                                 theorem_weight_sum, min=1.0
                             )
-                            micro_batch_metrics["actor/theorem_statement_ce_loss"] = theorem_loss.detach().item()
-                            micro_batch_metrics["actor/theorem_statement_active_tokens"] = (
-                                (theorem_statement_weights > 0).sum().detach().item()
-                            )
-                            micro_batch_metrics["actor/theorem_statement_weight_sum"] = theorem_weight_sum.detach().item()
+                            if theorem_weight_sum > 0:
+                                micro_batch_metrics["actor/theorem_statement_ce_loss"] = theorem_loss.detach().item()
+                                micro_batch_metrics["actor/theorem_statement_active_tokens"] = (
+                                    (theorem_statement_weights > 0).sum().detach().item()
+                                )
+                                micro_batch_metrics["actor/theorem_statement_weight_sum"] = (
+                                    theorem_weight_sum.detach().item()
+                                )
 
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz

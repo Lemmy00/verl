@@ -237,6 +237,9 @@ def compute_advantage(
             index=data.non_tensor_batch["uid"],
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
             valid_reward_mask=data.batch.get("valid_reward_mask", None),
+            # Must be forwarded: without it grpo_adv_std_floor silently stays 0.0 and
+            # the group-std floor never activates.
+            config=config,
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
@@ -317,6 +320,9 @@ class RayPPOTrainer:
         self.tokenizer = tokenizer
         self.processor = processor
         self.config = config
+        sdpo_cfg = config.actor_rollout_ref.actor.get("self_distillation", {})
+        self.tokenizer.padding_side = "left"
+        self.tokenizer.truncation_side = sdpo_cfg.get("reprompt_truncation", "right")
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
@@ -621,6 +627,372 @@ class RayPPOTrainer:
             metrics["lean/reward_mean"] = loss_reward_mean
         return metrics
 
+    @staticmethod
+    def _collect_solutions_by_uid(
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+        success_reward_threshold: float,
+        valid_sample_flags: Optional[list[bool]] = None,
+    ) -> dict[Any, list[int]]:
+        seq_scores = reward_tensor.sum(dim=-1).detach().cpu().numpy()
+        success_by_uid: dict[Any, list[int]] = defaultdict(list)
+        for idx, uid in enumerate(batch.non_tensor_batch["uid"]):
+            if valid_sample_flags is not None and idx < len(valid_sample_flags) and not valid_sample_flags[idx]:
+                continue
+            if seq_scores[idx] >= success_reward_threshold:
+                success_by_uid[uid].append(idx)
+        return success_by_uid
+
+    @staticmethod
+    def _remove_thinking_trace(text: str) -> str:
+        return re.sub(r"<think>.*?</think>\s*", "", text or "", flags=re.DOTALL)
+
+    @staticmethod
+    def _collect_feedback(
+        include_environment_feedback: bool,
+        reward_extra_infos_dict: Optional[dict[str, Any]],
+        batch_size: int,
+        use_fallback_environment_feedback: bool = True,
+        valid_reward_flags: Optional[list[bool]] = None,
+    ) -> list[str | None]:
+        feedback_list: list[str | None] = [None] * batch_size
+        if not include_environment_feedback or not reward_extra_infos_dict:
+            return feedback_list
+
+        canonical = reward_extra_infos_dict.get("canonical_annotated_code", [])
+        has_canonical = reward_extra_infos_dict.get("has_canonical_feedback", [])
+        statuses = reward_extra_infos_dict.get("lean_status", [])
+        clean_code = reward_extra_infos_dict.get("clean_lean_code", [])
+        for idx in range(batch_size):
+            if valid_reward_flags is not None and idx < len(valid_reward_flags) and not valid_reward_flags[idx]:
+                continue
+            if idx < len(canonical) and idx < len(has_canonical) and _truthy(has_canonical[idx]):
+                text = canonical[idx]
+                if isinstance(text, str) and text.strip():
+                    feedback_list[idx] = text
+                    continue
+            if not use_fallback_environment_feedback:
+                continue
+            if idx < len(statuses):
+                status = str(statuses[idx])
+                if status and status != "verified":
+                    code = clean_code[idx] if idx < len(clean_code) and isinstance(clean_code[idx], str) else ""
+                    feedback = f"Lean verifier status: {status}."
+                    if code.strip():
+                        feedback += f"\n\nAttempted Lean code:\n```lean4\n{code.strip()}\n```"
+                    feedback_list[idx] = feedback
+        return feedback_list
+
+    def _get_solution(
+        self,
+        idx: int,
+        success_by_uid: dict[Any, list[int]],
+        uids,
+        response_texts: list[str],
+        dont_reprompt_on_self_success: bool,
+        remove_thinking_from_demonstration: bool,
+    ) -> str | None:
+        solution_idxs = list(success_by_uid[uids[idx]])
+        if dont_reprompt_on_self_success:
+            solution_idxs = [j for j in solution_idxs if j != idx]
+        if not solution_idxs:
+            return None
+        solution = response_texts[solution_idxs[0]]
+        if remove_thinking_from_demonstration:
+            solution = self._remove_thinking_trace(solution)
+        return solution
+
+    def _maybe_build_self_distillation_batch(
+        self,
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+        reward_extra_infos_dict: Optional[dict[str, Any]] = None,
+    ) -> Optional[tuple[DataProto, dict[str, float]]]:
+        self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
+        loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+        if self_distillation_cfg is None or loss_mode != "sdpo":
+            return None
+
+        device = batch.batch["input_ids"].device
+        responses = batch.batch["responses"]
+        response_mask = batch.batch["response_mask"]
+        batch_size = len(batch)
+
+        response_texts = []
+        response_lengths: list[int] = []
+        for ids, mask in zip(responses.detach().cpu(), response_mask.detach().cpu(), strict=True):
+            valid_len = int(mask.sum().item())
+            response_lengths.append(valid_len)
+            response_texts.append(self.tokenizer.decode(ids[:valid_len], skip_special_tokens=True))
+
+        raw_prompts = batch.non_tensor_batch.get("raw_prompt", None)
+        extra_infos = batch.non_tensor_batch.get("extra_info", _object_array_1d([{} for _ in range(batch_size)]))
+        prompt_texts: list[str] = []
+        for idx in range(batch_size):
+            if raw_prompts is not None and len(raw_prompts[idx]) > 0:
+                prompt_texts.append(raw_prompts[idx][-1]["content"])
+            else:
+                extra = extra_infos[idx] if isinstance(extra_infos[idx], dict) else {}
+                prompt_texts.append(str(extra.get("question", "")))
+
+        raw_valid_reward_flags = reward_extra_infos_dict.get("lean_valid_reward") if reward_extra_infos_dict else None
+        if raw_valid_reward_flags is not None and len(raw_valid_reward_flags) == batch_size:
+            valid_reward_flags = [_truthy(flag) for flag in raw_valid_reward_flags]
+        else:
+            valid_reward_flags = [True] * batch_size
+
+        def optional_int(value: Any) -> int | None:
+            if value is None:
+                return None
+            if isinstance(value, str) and value.strip().lower() in {"", "none", "null"}:
+                return None
+            return int(value)
+
+        skip_clipped_responses = _truthy(self_distillation_cfg.get("skip_clipped_responses", False))
+        max_response_len = int(responses.shape[1])
+        max_target_response_len = optional_int(self_distillation_cfg.get("max_target_response_len", None))
+        # A rollout is clipped when it hits *whichever* ceiling binds first. vLLM
+        # caps generation at max_model_len - prompt_len (vllm_async_server.py), so
+        # when prompt_length + response_length exceeds max_model_len a long prompt
+        # runs out of context before reaching max_response_len. Comparing against
+        # max_response_len alone would then silently admit a context-truncated
+        # response as a valid self-distillation target.
+        rollout_cfg = self.config.actor_rollout_ref.get("rollout", None)
+        max_model_len = optional_int(rollout_cfg.get("max_model_len", None)) if rollout_cfg else None
+        prompt_width = int(batch.batch["input_ids"].shape[1]) - max_response_len
+        if max_model_len is not None and prompt_width > 0:
+            prompt_lengths = batch.batch["attention_mask"][:, :prompt_width].sum(dim=1).tolist()
+            response_caps = [
+                min(max_response_len, max(0, max_model_len - int(prompt_lengths[idx]))) for idx in range(batch_size)
+            ]
+        else:
+            response_caps = [max_response_len] * batch_size
+        clipped_response_flags = [
+            skip_clipped_responses and response_lengths[idx] >= response_caps[idx] for idx in range(batch_size)
+        ]
+        too_long_target_flags = [
+            max_target_response_len is not None and response_lengths[idx] > max_target_response_len
+            for idx in range(batch_size)
+        ]
+        target_valid_flags = [
+            valid_reward_flags[idx] and not clipped_response_flags[idx] and not too_long_target_flags[idx]
+            for idx in range(batch_size)
+        ]
+
+        feedback_list = self._collect_feedback(
+            include_environment_feedback=_truthy(self_distillation_cfg.get("include_environment_feedback", True)),
+            reward_extra_infos_dict=reward_extra_infos_dict,
+            batch_size=batch_size,
+            use_fallback_environment_feedback=_truthy(
+                self_distillation_cfg.get("use_fallback_environment_feedback", True)
+            ),
+            valid_reward_flags=target_valid_flags,
+        )
+        success_by_uid = self._collect_solutions_by_uid(
+            batch,
+            reward_tensor,
+            success_reward_threshold=float(self_distillation_cfg.get("success_reward_threshold", 1.0)),
+            valid_sample_flags=target_valid_flags,
+        )
+        solution_strs = [
+            (
+                self._get_solution(
+                    idx,
+                    success_by_uid,
+                    batch.non_tensor_batch["uid"],
+                    response_texts,
+                    _truthy(self_distillation_cfg.get("dont_reprompt_on_self_success", False)),
+                    _truthy(self_distillation_cfg.get("remove_thinking_from_demonstration", False)),
+                )
+                if target_valid_flags[idx]
+                else None
+            )
+            for idx in range(batch_size)
+        ]
+
+        feedback_only_without_solution = _truthy(
+            self_distillation_cfg.get("environment_feedback_only_without_solution", True)
+        )
+
+        def build_teacher_messages(idx: int) -> list[dict[str, str]]:
+            system_messages = []
+            if raw_prompts is not None:
+                system_messages = list(raw_prompts[idx][:-1])
+
+            has_solution = solution_strs[idx] is not None
+            has_feedback = feedback_list[idx] is not None
+            use_feedback = has_feedback and (not feedback_only_without_solution or not has_solution)
+            feedback_format = self_distillation_cfg.get("environment_feedback_format", "generic")
+
+            if use_feedback and feedback_format == "sft_proof_repair":
+                reprompt_text = self_distillation_cfg.proof_repair_template.format(
+                    prompt=prompt_texts[idx].rstrip(),
+                    failed_attempt=feedback_list[idx].strip(),
+                )
+                return system_messages + [{"role": "user", "content": reprompt_text}]
+
+            solution_section = ""
+            if has_solution:
+                solution_section = self_distillation_cfg.solution_template.format(
+                    successful_previous_attempt=solution_strs[idx]
+                )
+
+            feedback_section = ""
+            if use_feedback:
+                feedback_section = self_distillation_cfg.feedback_template.format(feedback_raw=feedback_list[idx])
+
+            if has_solution or use_feedback:
+                reprompt_text = self_distillation_cfg.reprompt_template.format(
+                    prompt=prompt_texts[idx],
+                    solution=solution_section,
+                    feedback=feedback_section,
+                )
+            else:
+                reprompt_text = prompt_texts[idx]
+
+            return system_messages + [{"role": "user", "content": reprompt_text}]
+
+        messages = [build_teacher_messages(idx) for idx in range(batch_size)]
+        apply_kwargs = dict(self.config.data.get("apply_chat_template_kwargs", {}) or {})
+
+        # Budget the teacher sequence as a WHOLE (reprompt + response) rather than
+        # carving a fixed slice for the prompt. Two reasons:
+        #  * correctness -- the reprompt ends with the trailing Lean error, the
+        #    closing fence and the generation marker, and _build_annotated_lean
+        #    emits its single error block last, so right-truncation destroys 100%
+        #    of the repair signal it exists to convey.
+        #  * memory -- the teacher forward materialises [T, vocab] logits, so the
+        #    peak is driven by reprompt + response, not by either alone.
+        # Over-budget reprompts are elided in the MIDDLE, keeping the head (question,
+        # opening fence, imports, theorem statement) and the tail (trailing error,
+        # closing fence, instruction, generation marker).
+        max_reprompt_len = int(self_distillation_cfg.get("max_reprompt_len", 4096))
+        max_teacher_total_len = optional_int(self_distillation_cfg.get("max_teacher_total_len", None))
+        min_reprompt_len = int(self_distillation_cfg.get("min_reprompt_len", 1024))
+
+        def _tokenize_reprompt(msgs: list[dict[str, str]]) -> list[int]:
+            try:
+                ids = self.tokenizer.apply_chat_template(
+                    msgs, tokenize=True, add_generation_prompt=True, **apply_kwargs
+                )
+            except TypeError:
+                ids = self.tokenizer.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True)
+            return list(ids)
+
+        reprompt_ids = [_tokenize_reprompt(msgs) for msgs in messages]
+        reprompt_elided_flags: list[bool] = []
+        reprompt_dropped: list[int] = []
+        kept_ids: list[list[int]] = []
+        for idx, ids in enumerate(reprompt_ids):
+            budget = max_reprompt_len
+            if max_teacher_total_len is not None:
+                budget = min(budget, max_teacher_total_len - response_lengths[idx])
+            budget = max(budget, min_reprompt_len)
+            if len(ids) > budget:
+                head = budget // 2
+                tail = budget - head
+                reprompt_dropped.append(len(ids) - budget)
+                reprompt_elided_flags.append(True)
+                ids = ids[:head] + ids[len(ids) - tail :] if tail else ids[:head]
+            else:
+                reprompt_dropped.append(0)
+                reprompt_elided_flags.append(False)
+            kept_ids.append(ids)
+
+        # Left padding, matching self.tokenizer.padding_side set in __init__.
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id or 0
+        width = max((len(ids) for ids in kept_ids), default=0)
+        teacher_prompt = {
+            "input_ids": torch.tensor(
+                [[pad_token_id] * (width - len(ids)) + ids for ids in kept_ids], dtype=torch.long
+            ),
+            "attention_mask": torch.tensor(
+                [[0] * (width - len(ids)) + [1] * len(ids) for ids in kept_ids], dtype=torch.long
+            ),
+        }
+
+        teacher_input_ids = torch.cat([teacher_prompt["input_ids"].to(device), responses], dim=1)
+        teacher_attention_mask = torch.cat([teacher_prompt["attention_mask"].to(device), response_mask], dim=1)
+        teacher_position_ids = compute_position_id_with_mask(teacher_attention_mask)
+
+        feedback_used = [
+            target_valid_flags[idx]
+            and feedback_list[idx] is not None
+            and (not feedback_only_without_solution or solution_strs[idx] is None)
+            for idx in range(batch_size)
+        ]
+        self_distillation_mask = torch.tensor(
+            [
+                target_valid_flags[idx] and (solution_strs[idx] is not None or feedback_used[idx])
+                for idx in range(batch_size)
+            ],
+            dtype=torch.float32,
+            device=device,
+        )
+
+        unique_uids = set(batch.non_tensor_batch["uid"])
+        target_response_lengths = [
+            response_lengths[idx] for idx in range(batch_size) if target_valid_flags[idx]
+        ]
+        metrics = {
+            "self_distillation/success_group_fraction": len(
+                [uid for uid in unique_uids if len(success_by_uid[uid]) > 0]
+            )
+            / max(len(unique_uids), 1),
+            "self_distillation/success_sample_fraction": sum(s is not None for s in solution_strs) / batch_size,
+            "self_distillation/feedback_available_fraction": sum(f is not None for f in feedback_list) / batch_size,
+            "self_distillation/feedback_used_fraction": sum(feedback_used) / batch_size,
+            "self_distillation/sft_proof_repair_fraction": sum(
+                feedback_used[idx]
+                and self_distillation_cfg.get("environment_feedback_format", "generic") == "sft_proof_repair"
+                for idx in range(batch_size)
+            )
+            / batch_size,
+            "self_distillation/invalid_reward_skipped_fraction": 1.0 - (sum(valid_reward_flags) / batch_size),
+            "self_distillation/clipped_response_skipped_fraction": sum(
+                valid_reward_flags[idx] and clipped_response_flags[idx] for idx in range(batch_size)
+            )
+            / batch_size,
+            "self_distillation/too_long_response_skipped_fraction": sum(
+                valid_reward_flags[idx] and too_long_target_flags[idx] and not clipped_response_flags[idx]
+                for idx in range(batch_size)
+            )
+            / batch_size,
+            "self_distillation/target_skipped_fraction": 1.0 - (sum(target_valid_flags) / batch_size),
+            # Reprompt shrinkage was previously invisible: apply_chat_template's
+            # truncation=True emits no warning and nothing read the prompt width.
+            "self_distillation/reprompt_elided_fraction": sum(reprompt_elided_flags) / batch_size,
+            "self_distillation/reprompt_tokens_dropped_mean": float(np.mean(reprompt_dropped))
+            if reprompt_dropped
+            else 0.0,
+            "self_distillation/reprompt_tokens_dropped_max": float(max(reprompt_dropped))
+            if reprompt_dropped
+            else 0.0,
+            "self_distillation/teacher_sequence_len_max": float(
+                max((len(ids) + response_lengths[idx] for idx, ids in enumerate(kept_ids)), default=0)
+            ),
+            "self_distillation/target_response_length_mean": float(np.mean(target_response_lengths))
+            if target_response_lengths
+            else 0.0,
+            "self_distillation/target_response_length_max": float(max(target_response_lengths))
+            if target_response_lengths
+            else 0.0,
+            "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),
+        }
+        return (
+            DataProto.from_dict(
+                tensors={
+                    "teacher_input_ids": teacher_input_ids,
+                    "teacher_attention_mask": teacher_attention_mask,
+                    "teacher_position_ids": teacher_position_ids,
+                    "self_distillation_mask": self_distillation_mask,
+                }
+            ),
+            metrics,
+        )
+
     def _proof_action_response_mask(self, batch: DataProto, metrics: dict[str, Any]) -> torch.Tensor | None:
         responses = batch.batch.get("responses", None)
         response_mask = batch.batch.get("response_mask", None)
@@ -684,6 +1056,17 @@ class RayPPOTrainer:
     def _tokenize_aux_target(self, text: str, max_response_len: int) -> tuple[list[int], list[tuple[int, int]], bool]:
         if not text:
             return [], [], False
+
+        # A slow tokenizer cannot return offset mappings. Without them every span
+        # maps to nothing, every aux row is dropped for having zero weight, and the
+        # entire feedback objective silently becomes a no-op with no error and no
+        # warning -- the only tell being feedback/aux_rows reading 0. Fail loudly.
+        if not getattr(self.tokenizer, "is_fast", False):
+            raise RuntimeError(
+                "feedback_loss requires a fast tokenizer (offset mapping); got "
+                f"{type(self.tokenizer).__name__}. Disable actor.feedback_loss.enabled "
+                "or load a fast tokenizer."
+            )
 
         try:
             encoded = self.tokenizer(
@@ -753,6 +1136,23 @@ class RayPPOTrainer:
         error_feedback_token_weight = float(feedback_cfg.get("error_feedback_weight", 0.5))
         theorem_statement_enabled = _truthy(feedback_cfg.get("theorem_statement_enabled", True))
         theorem_statement_weight = float(feedback_cfg.get("theorem_statement_weight", 0.05))
+        # Present the CE target in the same surface form the policy emits at rollout
+        # time (prose lead-in + ```lean4 fence). Literal split, not str.format: Lean
+        # code is full of braces. Feedback spans are character offsets into the bare
+        # annotated code, so they shift by the prefix length.
+        if feedback_cfg.get("target_template", None) is None:
+            raise ValueError(
+                "feedback_loss.target_template is missing from the actor config. Without it the CE "
+                "target would silently be emitted unwrapped, in a surface form the policy never "
+                "produces. Update the config (verl/trainer/config/actor/actor.yaml)."
+            )
+        target_template = str(feedback_cfg.get("target_template"))
+        if target_template.count("{code}") != 1:
+            raise ValueError(
+                "feedback_loss.target_template must contain '{code}' exactly once, got "
+                f"{target_template!r}"
+            )
+        target_prefix, target_suffix = target_template.split("{code}")
 
         canonical_codes = batch.non_tensor_batch.get("canonical_annotated_code", _object_array_1d(["" for _ in range(len(batch))]))
         feedback_spans = batch.non_tensor_batch.get("feedback_spans", _object_array_1d([[] for _ in range(len(batch))]))
@@ -788,23 +1188,30 @@ class RayPPOTrainer:
         padding_aux_rows = 0
         truncated_feedback_targets = 0
         truncated_theorem_targets = 0
+        dropped_feedback_targets = 0
 
         for idx, (code, spans, err_spans, flag) in enumerate(
             zip(canonical_codes, feedback_spans, error_spans, has_canonical, strict=True)
         ):
             if not _truthy(flag) or not isinstance(code, str) or not code.strip():
                 continue
+            shift = len(target_prefix)
             token_ids, weights, err_weights, truncated = self._feedback_token_weights(
-                code,
-                spans,
-                err_spans,
+                f"{target_prefix}{code}{target_suffix}",
+                [[int(a) + shift, int(b) + shift] for a, b in (spans or [])],
+                [[int(a) + shift, int(b) + shift] for a, b in (err_spans or [])],
                 max_response_len,
                 feedback_token_weight=feedback_token_weight,
                 error_feedback_token_weight=error_feedback_token_weight,
             )
-            if not token_ids or weights.sum().item() <= 0:
-                continue
             truncated_feedback_targets += int(truncated)
+            if not token_ids or weights.sum().item() <= 0:
+                # Every supervised span fell past max_response_len, so this row would
+                # contribute nothing. Counting it matters: the increment used to sit
+                # after this `continue`, so a target truncated hard enough to lose all
+                # its feedback vanished from the objective AND from the metrics.
+                dropped_feedback_targets += 1
+                continue
             n_tokens = len(token_ids)
             response = torch.full((max_response_len,), int(pad_token_id), dtype=base["responses"].dtype, device=base["responses"].device)
             response_mask = torch.zeros((max_response_len,), dtype=base["response_mask"].dtype, device=base["response_mask"].device)
@@ -849,6 +1256,8 @@ class RayPPOTrainer:
                 theorem_aux_rows += 1
 
         if not aux_responses:
+            metrics["feedback/dropped_targets"] = dropped_feedback_targets
+            metrics["feedback/truncated_targets"] = truncated_feedback_targets
             metrics["feedback/active_tokens"] = 0.0
             metrics["feedback/theorem_statement_active_tokens"] = 0.0
             return batch
@@ -917,8 +1326,14 @@ class RayPPOTrainer:
                 aux_tensor = torch.zeros_like(tensor.index_select(0, source_index.to(tensor.device)))
             tensors[key] = torch.cat([tensor, aux_tensor], dim=0)
 
+        # Must carry forward the EXISTING ppo_response_mask, not response_mask: by this
+        # point it already encodes two deliberate maskings applied in fit() --
+        # _proof_action_response_mask (the model's own generated <feedback> blocks are
+        # excluded from the PPO objective) and valid_reward_mask (rows whose Lean reward
+        # was invalid are zeroed). Rebuilding it from response_mask silently discarded
+        # both, and only on steps that happened to produce aux rows.
         tensors["ppo_response_mask"] = torch.cat(
-            [base["response_mask"], torch.zeros_like(aux_response_mask)], dim=0
+            [base.get("ppo_response_mask", base["response_mask"]), torch.zeros_like(aux_response_mask)], dim=0
         )
         tensors["feedback_loss_weights"] = torch.cat(
             [torch.zeros((bsz, max_response_len), dtype=torch.float32, device=combined_ce_weights.device), combined_ce_weights],
@@ -949,7 +1364,53 @@ class RayPPOTrainer:
             (theorem_weights > 0).sum().item() / max(theorem_aux_rows, 1)
         )
         metrics["feedback/truncated_targets"] = truncated_feedback_targets
+        metrics["feedback/dropped_targets"] = dropped_feedback_targets
         metrics["feedback/theorem_statement_truncated_targets"] = truncated_theorem_targets
+
+        # Deal the rows round-robin across the DP ranks. DataProto.chunk() splits
+        # contiguously, and the aux rows are all appended at the end, so without this
+        # the last ranks receive only aux rows (zero PPO gradient) and the first ranks
+        # only real rows (zero feedback gradient). At the observed ~87% canonical-feedback
+        # rate that is a clean 4/4 split of an 8-rank job, and since FSDP averages
+        # gradients across ranks it silently halves BOTH objectives -- by a factor that
+        # drifts step to step with how many rows produced canonical feedback.
+        total_rows = bsz + len(aux_responses)
+        if dp_size > 1 and total_rows % dp_size == 0:
+
+            def _interleave(rows: list[int]) -> list[int]:
+                """Blend rollout and aux rows proportionally within one rank's slice.
+
+                Dealing rows round-robin balances the RANKS, but each rank still
+                receives its rollout rows before its aux rows. update_policy splits a
+                rank's rows into mini-batches and takes an OPTIMIZER STEP PER
+                MINI-BATCH, so an unmixed slice puts RL+KL in one step and the feedback
+                CE in another. That is not the paper's summed objective, and because
+                Adam renormalises each step, lambda_coef loses its meaning entirely.
+
+                Verified by sweep: with one aux row per rollout row (theorem-statement CE
+                off, so n_aux <= bsz) no mini-batch is ever CE-only. Enabling
+                theorem_statement_enabled can push n_aux above bsz, where a short trailing
+                mini-batch can again become CE-only; re-check the split if you turn it on.
+                """
+                rollout_rows = [row for row in rows if row < bsz]
+                aux_rows = [row for row in rows if row >= bsz]
+                if not rollout_rows or not aux_rows:
+                    return rows
+                keyed = [(idx / len(rollout_rows), 0, row) for idx, row in enumerate(rollout_rows)]
+                keyed += [(idx / len(aux_rows), 1, row) for idx, row in enumerate(aux_rows)]
+                keyed.sort()
+                return [row for _, _, row in keyed]
+
+            order = [
+                row
+                for start in range(dp_size)
+                for row in _interleave(list(range(start, total_rows, dp_size)))
+            ]
+            index = torch.tensor(order, dtype=torch.long)
+            tensors = {key: value.index_select(0, index.to(value.device)) for key, value in tensors.items()}
+            order_np = np.asarray(order)
+            non_tensors = {key: value[order_np] for key, value in non_tensors.items()}
+
         return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=deepcopy(batch.meta_info))
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
@@ -1958,6 +2419,14 @@ class RayPPOTrainer:
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
                         batch.batch["token_level_scores"] = reward_tensor
+
+                        self_distillation_data = self._maybe_build_self_distillation_batch(
+                            batch, reward_tensor, reward_extra_infos_dict
+                        )
+                        if self_distillation_data is not None:
+                            self_distillation_batch, self_distillation_metrics = self_distillation_data
+                            batch = batch.union(self_distillation_batch)
+                            metrics.update(self_distillation_metrics)
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update(

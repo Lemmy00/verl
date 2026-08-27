@@ -22,10 +22,12 @@ __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
 from collections import defaultdict
 from enum import Enum
+import math
 from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from omegaconf import DictConfig
 
 import verl.utils.torch_functional as verl_F
@@ -262,6 +264,28 @@ def compute_gae_advantage_return(
     return advantages, returns
 
 
+def _resolve_grpo_adv_std_floor(config) -> float:
+    """Read and validate the GRPO group-std floor.
+
+    Validated rather than trusted: Hydra will happily accept nan, inf or a negative
+    value, and each fails silently in a different way. inf clamps every denominator
+    and drives ALL advantages to zero -- training would proceed, learning nothing.
+    """
+    if config is None:
+        return 0.0
+    try:
+        raw = config.get("grpo_adv_std_floor", 0.0)
+    except AttributeError:
+        raw = getattr(config, "grpo_adv_std_floor", 0.0)
+    value = float(raw or 0.0)
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError(
+            "algorithm.grpo_adv_std_floor must be a finite non-negative float "
+            f"(0 disables the floor), got {raw!r}"
+        )
+    return value
+
+
 # NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
 @register_adv_est(AdvantageEstimator.GRPO)  # or simply: @register_adv_est("grpo")
 def compute_grpo_outcome_advantage(
@@ -301,6 +325,8 @@ def compute_grpo_outcome_advantage(
         Returns: `(torch.Tensor)`
             shape is (bs, response_length)
     """
+    grpo_adv_std_floor = _resolve_grpo_adv_std_floor(config)
+
     scores = token_level_rewards.sum(dim=-1)
     if valid_reward_mask is None:
         valid_reward_mask = torch.ones_like(scores, dtype=torch.bool)
@@ -326,6 +352,24 @@ def compute_grpo_outcome_advantage(
                 id2std[idx] = torch.std(scores_tensor)
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
+
+        # Lower-bound the denominator. A group whose only reward variance comes from a
+        # small shaping term (e.g. a timeout penalty) has a std proportional to that term,
+        # so dividing by it cancels the coefficient and rescales ANY penalty back to full
+        # strength -- a 0.001 penalty and a 0.1 penalty give identical advantages.
+        # Flooring stops the denominator collapsing, so the advantage becomes proportional
+        # to the coefficient again.
+        #
+        # The principled value is 1/sqrt(G): for a 0/1 outcome reward with k successes out
+        # of G the sample variance (torch.std uses correction=1) is k(G-k)/(G(G-1)),
+        # minimised over k in 1..G-1 at k=1 or k=G-1, giving 1/G. So 1/sqrt(G) is the
+        # SMALLEST std any group with real correctness variance can have, and a floor just
+        # below it can never touch such a group -- it acts only on groups that are
+        # uniformly right or uniformly wrong. Set it a hair under 1/sqrt(G): torch.std runs
+        # in float32 and lands ~6e-9 below the float64 value on an exactly-minimal group.
+        if grpo_adv_std_floor > 0.0:
+            for idx in id2std:
+                id2std[idx] = torch.clamp(id2std[idx], min=grpo_adv_std_floor)
         for i in range(bsz):
             if index[i] not in id2mean or not valid_reward_mask[i]:
                 scores[i] = 0.0
@@ -357,6 +401,11 @@ def compute_grpo_vectorized_outcome_advantage(
         scores = token_level_rewards.sum(dim=-1)
         g = as_torch_index(index, device=scores.device)
         mean_g, std_g, _ = group_mean_std(scores, g, eps=epsilon, device=scores.device)
+        # Same floor as the scalar GRPO estimator; without it a group whose only
+        # variance is a small shaping term has its coefficient cancelled out.
+        grpo_adv_std_floor = _resolve_grpo_adv_std_floor(config)
+        if grpo_adv_std_floor > 0.0:
+            std_g = torch.clamp(std_g, min=grpo_adv_std_floor)
         if norm_adv_by_std_in_grpo:
             scalars = (scores - mean_g[g]) / (std_g[g] + epsilon)
         else:
@@ -1086,6 +1135,150 @@ def agg_loss(
         raise ValueError(f"Invalid loss_agg_mode: {loss_agg_mode}")
 
     return loss
+
+
+def compute_self_distillation_loss(
+    student_log_probs: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    self_distillation_config: Any,
+    old_log_probs: Optional[torch.Tensor] = None,
+    student_all_log_probs: Optional[torch.Tensor] = None,
+    teacher_all_log_probs: Optional[torch.Tensor] = None,
+    student_topk_log_probs: Optional[torch.Tensor] = None,
+    teacher_topk_log_probs: Optional[torch.Tensor] = None,
+    self_distillation_mask: Optional[torch.Tensor] = None,
+    loss_agg_mode: str = "token-mean",
+    rollout_is_weights: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """SDPO loss: distill feedback-conditioned teacher probabilities into the policy."""
+
+    loss_mask = response_mask
+    if self_distillation_mask is not None:
+        loss_mask = loss_mask * self_distillation_mask.unsqueeze(1).to(loss_mask.dtype)
+
+    tail_metric_tensors = {}
+    if self_distillation_config.full_logit_distillation:
+        use_topk = self_distillation_config.distillation_topk is not None
+        if use_topk:
+            if student_topk_log_probs is None or teacher_topk_log_probs is None:
+                raise ValueError("top-k SDPO requires student_topk_log_probs and teacher_topk_log_probs.")
+
+            def add_tail(log_probs: torch.Tensor) -> torch.Tensor:
+                log_probs = log_probs.float()
+                tail_epsilon = float(getattr(self_distillation_config, "distillation_tail_epsilon", 1e-4))
+                max_log_s = math.log1p(-tail_epsilon)
+                log_s = torch.logsumexp(log_probs, dim=-1, keepdim=True)
+                topk_scale = torch.clamp(torch.as_tensor(max_log_s, device=log_probs.device) - log_s, max=0.0)
+                bounded_log_probs = log_probs + topk_scale
+                bounded_log_s = torch.logsumexp(bounded_log_probs, dim=-1, keepdim=True)
+                tail_log = torch.log1p(-torch.exp(bounded_log_s))
+                return torch.cat([bounded_log_probs, tail_log], dim=-1)
+
+            def renorm(log_probs: torch.Tensor) -> torch.Tensor:
+                log_probs = log_probs.float()
+                return log_probs - torch.logsumexp(log_probs, dim=-1, keepdim=True)
+
+            student_distill_log_probs = student_topk_log_probs
+            teacher_distill_log_probs = teacher_topk_log_probs
+            if self_distillation_config.distillation_add_tail:
+                student_distill_log_probs = add_tail(student_distill_log_probs)
+                teacher_distill_log_probs = add_tail(teacher_distill_log_probs)
+                tail_metric_tensors = {
+                    "student": torch.exp(student_distill_log_probs[..., -1]),
+                    "teacher": torch.exp(teacher_distill_log_probs[..., -1]),
+                }
+            else:
+                student_distill_log_probs = renorm(student_distill_log_probs)
+                teacher_distill_log_probs = renorm(teacher_distill_log_probs)
+        else:
+            if student_all_log_probs is None or teacher_all_log_probs is None:
+                raise ValueError("full-logit SDPO requires student_all_log_probs and teacher_all_log_probs.")
+            student_distill_log_probs = student_all_log_probs
+            teacher_distill_log_probs = teacher_all_log_probs
+
+        alpha = float(self_distillation_config.alpha)
+        if alpha == 0.0:
+            kl_loss = F.kl_div(student_distill_log_probs, teacher_distill_log_probs, reduction="none", log_target=True)
+        elif alpha == 1.0:
+            kl_loss = F.kl_div(teacher_distill_log_probs, student_distill_log_probs, reduction="none", log_target=True)
+        else:
+            alpha_t = torch.tensor(alpha, dtype=student_distill_log_probs.dtype, device=student_distill_log_probs.device)
+            mixture_log_probs = torch.logsumexp(
+                torch.stack(
+                    [
+                        student_distill_log_probs + torch.log1p(-alpha_t),
+                        teacher_distill_log_probs + torch.log(alpha_t),
+                    ]
+                ),
+                dim=0,
+            )
+            kl_teacher = F.kl_div(mixture_log_probs, teacher_distill_log_probs, reduction="none", log_target=True)
+            kl_student = F.kl_div(mixture_log_probs, student_distill_log_probs, reduction="none", log_target=True)
+            kl_loss = torch.lerp(kl_student, kl_teacher, alpha_t)
+        per_token_loss = kl_loss.sum(dim=-1)
+    else:
+        if float(self_distillation_config.alpha) != 1.0:
+            raise ValueError("sampled-token SDPO only supports alpha=1.0 (reverse KL policy-gradient form).")
+        log_ratio = student_log_probs - teacher_log_probs
+        per_token_loss = log_ratio.detach() * student_log_probs
+
+    is_clip = self_distillation_config.is_clip
+    if is_clip is not None:
+        if old_log_probs is None:
+            raise ValueError("old_log_probs is required for SDPO importance-ratio clipping.")
+        negative_approx_kl = torch.clamp((student_log_probs - old_log_probs).detach(), min=-20.0, max=20.0)
+        per_token_loss = per_token_loss * torch.exp(negative_approx_kl).clamp(max=float(is_clip))
+
+    if rollout_is_weights is not None:
+        per_token_loss = per_token_loss * rollout_is_weights
+
+    loss_unscaled = agg_loss(
+        loss_mat=per_token_loss,
+        loss_mask=loss_mask,
+        loss_agg_mode=loss_agg_mode,
+        batch_num_tokens=loss_mask.sum().clamp(min=1.0),
+    )
+    loss_coef = float(getattr(self_distillation_config, "loss_coef", 1.0))
+    loss = loss_unscaled * loss_coef
+    active_tokens = loss_mask.sum()
+    if active_tokens.detach().item() > 0:
+        student_logp_mean = verl_F.masked_mean(student_log_probs, loss_mask).detach()
+        teacher_logp_mean = verl_F.masked_mean(teacher_log_probs, loss_mask).detach()
+    else:
+        student_logp_mean = student_log_probs.sum().detach() * 0.0
+        teacher_logp_mean = teacher_log_probs.sum().detach() * 0.0
+    metrics = {
+        "self_distillation/loss": loss.detach().item(),
+        "self_distillation/loss_unscaled": loss_unscaled.detach().item(),
+        "self_distillation/loss_coef": loss_coef,
+        "self_distillation/active_tokens": active_tokens.detach().item(),
+        "self_distillation/student_logp_mean": student_logp_mean.item(),
+        "self_distillation/teacher_logp_mean": teacher_logp_mean.item(),
+    }
+    if tail_metric_tensors:
+        if active_tokens.detach().item() > 0:
+            active_mask = loss_mask.to(torch.bool)
+            student_tail = tail_metric_tensors["student"][active_mask].detach()
+            teacher_tail = tail_metric_tensors["teacher"][active_mask].detach()
+            student_tail_mean = student_tail.mean().item()
+            student_tail_min = student_tail.min().item()
+            teacher_tail_mean = teacher_tail.mean().item()
+            teacher_tail_min = teacher_tail.min().item()
+        else:
+            student_tail_mean = 0.0
+            student_tail_min = 0.0
+            teacher_tail_mean = 0.0
+            teacher_tail_min = 0.0
+        metrics.update(
+            {
+                "self_distillation/student_tail_prob_mean": student_tail_mean,
+                "self_distillation/student_tail_prob_min": student_tail_min,
+                "self_distillation/teacher_tail_prob_mean": teacher_tail_mean,
+                "self_distillation/teacher_tail_prob_min": teacher_tail_min,
+            }
+        )
+    return loss, metrics
 
 
 @deprecated("verl.trainer.ppo.core_algos.compute_policy_loss_vanilla")

@@ -55,3 +55,92 @@ def test_lean_reward_diagnostics_aggregates_timeout_causes_and_latency():
     assert metrics["lean/restart_warmups_total"] == 1.0
     assert metrics["lean/loss_reward_mean"] == pytest.approx(1 / 3)
     assert metrics["lean/reward_mean"] == pytest.approx(1 / 3)
+
+
+def test_lean_reward_diagnostics_separates_attempts_from_closed_blocks():
+    """The fence dodge -- N openers, one closing fence -- is invisible in every metric
+    that predates it: lean/attempts_mean, lean/repair_rate and lean/penalized_rate all
+    FALL as it spreads, so the batch reads as a policy that learned to be concise.
+    lean/unclosed_block_rate is the only series that rises."""
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    rewards = torch.zeros(4, 2)
+    extra = {
+        "lean_status": ["verified", "invalid_proof", "invalid_proof", "no_lean_code"],
+        # Row 1 is the dodge: eight attempts, one closed block.
+        "lean_closed_blocks": [1, 1, 8, 0],
+        "lean_block_attempts": [1, 8, 8, 3],
+        "lean_block_comment_chars": [0, 0, 40, 0],
+        # Of row 2's 40 comment characters, 4 are not /- <feedback> -/ annotations.
+        "lean_block_other_comment_chars": [0, 0, 4, 0],
+        "lean_block_body_chars": [30, 30, 100, 0],
+    }
+
+    metrics = trainer._lean_reward_diagnostics(rewards, extra)
+
+    assert metrics["lean/attempts_mean"] == pytest.approx(10 / 4)
+    assert metrics["lean/attempt_blocks_mean"] == pytest.approx(20 / 4)
+    assert metrics["lean/unclosed_blocks_mean"] == pytest.approx(10 / 4)
+    # Rows 1 and 3 abandoned an opener; rows 0 and 2 closed everything they opened.
+    assert metrics["lean/unclosed_block_rate"] == pytest.approx(2 / 4)
+    assert metrics["lean/block_comment_chars_mean"] == pytest.approx(10.0)
+    assert metrics["lean/block_other_comment_chars_mean"] == pytest.approx(1.0)
+    assert metrics["lean/block_body_chars_mean"] == pytest.approx(40.0)
+
+
+def test_lean_reward_diagnostics_separates_feedback_comments_from_the_rest():
+    """The total cannot see rambling move inside the fence. Measured over steps
+    110/116/120 of qwen3-sft-feedback-grpo-lr2e6, 98.5% of in-fence comment characters
+    (15,839,001 of 16,079,033) are the /- <feedback> -/ blocks the SFT format requires,
+    so a doubling of genuine rambling moves lean/block_comment_chars_mean by 1.5% and
+    hides in the step-to-step wobble of feedback volume. The residue starts near zero,
+    so its slope is readable -- and the two series move independently, which is why both
+    are emitted."""
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    rewards = torch.zeros(2, 2)
+
+    # More feedback, no rambling: the total moves, the residue does not.
+    feedback_heavy = trainer._lean_reward_diagnostics(
+        rewards,
+        {
+            "lean_block_comment_chars": [1000, 3000],
+            "lean_block_other_comment_chars": [0, 0],
+        },
+    )
+    assert feedback_heavy["lean/block_comment_chars_mean"] == pytest.approx(2000.0)
+    assert feedback_heavy["lean/block_other_comment_chars_mean"] == pytest.approx(0.0)
+
+    # The same feedback volume with rambling added: a 1.5% move in the total that would
+    # be unreadable on its own, and a residue that went from nothing to something.
+    rambling = trainer._lean_reward_diagnostics(
+        rewards,
+        {
+            "lean_block_comment_chars": [1015, 3045],
+            "lean_block_other_comment_chars": [15, 45],
+        },
+    )
+    total_move = (
+        rambling["lean/block_comment_chars_mean"]
+        / feedback_heavy["lean/block_comment_chars_mean"]
+        - 1.0
+    )
+    assert total_move == pytest.approx(0.015)
+    assert rambling["lean/block_other_comment_chars_mean"] == pytest.approx(30.0)
+
+
+def test_lean_reward_diagnostics_skips_new_series_when_the_keys_are_absent():
+    """A reward manager that does not emit them must produce NO metric rather than a
+    misleading 0.0 -- a missing panel is the signal."""
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    rewards = torch.zeros(2, 2)
+    metrics = trainer._lean_reward_diagnostics(rewards, {"lean_closed_blocks": [1, 2]})
+
+    assert "lean/attempts_mean" in metrics
+    for absent in (
+        "lean/attempt_blocks_mean",
+        "lean/unclosed_block_rate",
+        "lean/unclosed_blocks_mean",
+        "lean/block_comment_chars_mean",
+        "lean/block_other_comment_chars_mean",
+        "lean/block_body_chars_mean",
+    ):
+        assert absent not in metrics

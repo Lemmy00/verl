@@ -664,13 +664,25 @@ class DataParallelPPOActor(BasePPOActor):
 
         metrics = {
             "actor/pg_loss": 0.0,
+            # actor/kl_loss is aggregated over the FULL response_mask, on every row that
+            # carries a policy gradient -- see the KL block in the micro-batch loop below.
+            # It used to use the narrowed ppo_response_mask, which left the masked tail with
+            # no pull back toward the reference policy at all; that unanchored tail is
+            # exactly where the 5.7e-03 -> 1.4e-01 drift lived. Rows with a fully zeroed
+            # ppo_response_mask (the auxiliary CE rows, which have no real ref_log_prob) are
+            # excluded, as they always were.
             "actor/kl_loss": 0.0,
-            # actor/kl_loss is aggregated over ppo_response_mask, which now stops at the
-            # last closed ```lean4 block. The drift that produced the 5.7e-03 -> 1.4e-01
-            # collapse lived in the TAIL, i.e. outside that mask, so this whole-response
-            # companion is what keeps the detector able to see a repeat. Diagnostic only:
-            # it never enters the loss.
+            # Kept so the drift detector's series stays continuous across the mask switch,
+            # but it is NOT an independent measurement any more: the loss KL and this
+            # diagnostic now coincide by construction, because both aggregate over the full
+            # response of the same rows. It is copied from kl_loss rather than recomputed,
+            # so the two can never silently disagree.
             "actor/kl_loss_full_response": 0.0,
+            # The complementary half, and the only genuinely distinct KL number left: the
+            # same kld restricted to the narrowed ppo_response_mask, i.e. the tokens that
+            # still get a policy gradient. actor/kl_loss minus this is the tail's share.
+            # Diagnostic only -- it never enters the loss.
+            "actor/kl_loss_ppo_mask": 0.0,
         }
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
@@ -850,8 +862,61 @@ class DataParallelPPOActor(BasePPOActor):
                         kld = kl_penalty(
                             logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
                         )
-                        if ppo_response_mask.any():
-                            kl_loss = agg_loss(loss_mat=kld, loss_mask=ppo_response_mask, loss_agg_mode=loss_agg_mode)
+                        # The reference-KL brake aggregates over the FULL response_mask,
+                        # NOT the narrowed ppo_response_mask. ppo_response_mask stops one
+                        # token past the last closed ```lean4 block, so while it also gated
+                        # the KL, every token in the masked tail was completely unanchored:
+                        # no policy gradient AND no pull back toward the reference policy.
+                        # That is where the 5.7e-03 -> 1.4e-01 drift lived. The KL is a
+                        # divergence brake, not a credit-assignment signal -- it should hold
+                        # every token the model actually emitted.
+                        #
+                        # The PPO policy-gradient term above (policy_loss_fn /
+                        # compute_self_distillation_loss) and the entropy bonus deliberately
+                        # KEEP ppo_response_mask. Crossing the two masks would put a policy
+                        # gradient back on the tail, which is the entire bug the narrowing
+                        # fixed. This KL term is the ONLY consumer of the full mask inside
+                        # the loss.
+                        #
+                        # ROW GATE. The widening applies only to rows that carry a policy
+                        # gradient at all. A row whose ppo_response_mask is ENTIRELY zero is
+                        # not an ordinary rollout row with a narrowed tail -- it is one of
+                        # the feedback / error-feedback / theorem-statement auxiliary CE
+                        # rows appended by _maybe_append_feedback_aux_batch, and those rows
+                        # carry NO reference log-prob. That function runs AFTER
+                        # ref_log_prob is unioned into the batch and copies only
+                        # prompts/responses/input_ids/attention_mask/position_ids/
+                        # response_mask/teacher_*; every other key, ref_log_prob included,
+                        # falls through to `torch.zeros_like`, so an aux row arrives with
+                        # ref_log_prob == 0.0 exactly -- a placeholder, not the reference
+                        # policy. Aggregating it into the KL is not a brake: it is a pull
+                        # toward log p == 0, i.e. probability 1.0 on every auxiliary target
+                        # token, which is unbounded memorisation pressure directly opposing
+                        # their CE objective (and it hits the unweighted tokens too).
+                        # Measured on the shipped config (low_var_kl, seq-mean-token-mean,
+                        # kl_loss_coef 0.01): one aux row in a two-row micro-batch moves
+                        # actor/kl_loss from 5.0e-05 to 2.19 and puts 636x more gradient on
+                        # an aux token than on a rollout token. kld = 4.39 sits under the
+                        # low_var_kl clamp of 10, so that gradient is live, not saturated.
+                        # It would also drown actor/kl_loss as a drift detector -- the exact
+                        # signal this change exists to restore.
+                        #
+                        # The gate is per-ROW and never per-token: a real rollout row keeps
+                        # its ENTIRE response in the KL, masked tail included. That is the
+                        # point of this change and the gate does not touch it. When no
+                        # narrowing is in play, ppo_response_mask IS response_mask, every
+                        # non-empty row passes the gate, and this is a no-op.
+                        #
+                        # Rows zeroed by valid_reward_mask also fail the gate and stay out
+                        # of the KL. They do have a genuine ref_log_prob, so including them
+                        # would be sound, but excluding them is exactly their pre-change
+                        # treatment -- no regression, and it keeps the rule one sentence
+                        # long: the KL holds the whole response of every row the policy
+                        # gradient touches, and nothing else.
+                        kl_row = ppo_response_mask.any(dim=-1, keepdim=True)
+                        kl_loss_mask = response_mask.to(bool) & kl_row
+                        if kl_loss_mask.any():
+                            kl_loss = agg_loss(loss_mat=kld, loss_mask=kl_loss_mask, loss_agg_mode=loss_agg_mode)
                         else:
                             kl_loss = log_prob.sum() * 0.0
 
@@ -859,19 +924,26 @@ class DataParallelPPOActor(BasePPOActor):
                         metrics["actor/kl_loss"] += kl_loss.detach().item() * loss_scale_factor
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
-                        # Same KL over the WHOLE response, outside the graph. The KL brake
-                        # itself is deliberately left narrowed to the tokens that still get
-                        # a policy gradient; this is the number to watch for tail drift,
-                        # which by construction actor/kl_loss can no longer see.
+                        # actor/kl_loss is now itself the whole-response KL, so the
+                        # full-response diagnostic is the SAME NUMBER, not a second opinion.
+                        # The key is kept only so the drift detector's history survives the
+                        # switch, and it is assigned from kl_loss instead of being recomputed
+                        # so the pair can never disagree or read as two measurements.
+                        metrics["actor/kl_loss_full_response"] += kl_loss.detach().item() * loss_scale_factor
+
+                        # The genuinely new number: the same kld over the narrowed mask, i.e.
+                        # the tokens that still receive a policy gradient. This is what
+                        # actor/kl_loss used to report. Outside the graph; the gap between
+                        # actor/kl_loss and this is the tail's contribution.
                         with torch.no_grad():
-                            if response_mask.any():
-                                full_kl = agg_loss(
+                            if ppo_response_mask.any():
+                                ppo_mask_kl = agg_loss(
                                     loss_mat=kld,
-                                    loss_mask=response_mask,
+                                    loss_mask=ppo_response_mask,
                                     loss_agg_mode=loss_agg_mode,
                                 )
-                                metrics["actor/kl_loss_full_response"] += (
-                                    full_kl.detach().item() * loss_scale_factor
+                                metrics["actor/kl_loss_ppo_mask"] += (
+                                    ppo_mask_kl.detach().item() * loss_scale_factor
                                 )
 
                     feedback_cfg = self.config.get("feedback_loss", None)

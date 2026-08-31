@@ -125,6 +125,13 @@ algorithm:
   # Lower bound on the GRPO group std (0.0 disables). Mirrors ppo_trainer.yaml; this
   # schema is independent, so omitting it makes a plain override fail to compose.
   grpo_adv_std_floor: 0.0
+
+  # Zero the PPO response mask after the last CLOSED ```lean4 block. The reward scores only
+  # that block, but GRPO broadcasts one scalar advantage over every generated token, so a
+  # verified rollout reinforces whatever it wrote afterwards just as hard as the proof
+  # (measured: rollout gibberish 1.2% -> 46.9% in two steps). A row with no closed block is
+  # never truncated -- it is priced by the no_lean_code penalty instead.
+  mask_after_last_lean_block: True
   use_kl_in_reward: False
   kl_penalty: kl # how to estimate kl divergence
   kl_ctrl:

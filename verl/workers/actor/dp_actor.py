@@ -665,6 +665,12 @@ class DataParallelPPOActor(BasePPOActor):
         metrics = {
             "actor/pg_loss": 0.0,
             "actor/kl_loss": 0.0,
+            # actor/kl_loss is aggregated over ppo_response_mask, which now stops at the
+            # last closed ```lean4 block. The drift that produced the 5.7e-03 -> 1.4e-01
+            # collapse lived in the TAIL, i.e. outside that mask, so this whole-response
+            # companion is what keeps the detector able to see a repeat. Diagnostic only:
+            # it never enters the loss.
+            "actor/kl_loss_full_response": 0.0,
         }
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
@@ -824,6 +830,17 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             entropy_agg = log_prob.sum() * 0.0
                         micro_batch_metrics["actor/entropy"] = entropy_agg.detach().item()
+                        # The entropy collapse detector (0.019 -> 3.5) has to keep seeing
+                        # the whole response: this value overrides the one computed over
+                        # response_mask at old_log_prob time, and ppo_response_mask now
+                        # ends at the last closed lean block.
+                        with torch.no_grad():
+                            if response_mask.any():
+                                micro_batch_metrics["actor/entropy_full_response"] = agg_loss(
+                                    loss_mat=entropy,
+                                    loss_mask=response_mask,
+                                    loss_agg_mode=loss_agg_mode,
+                                ).detach().item()
                         if entropy_coeff != 0:
                             policy_loss -= entropy_agg * entropy_coeff
 
@@ -841,6 +858,21 @@ class DataParallelPPOActor(BasePPOActor):
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                         metrics["actor/kl_loss"] += kl_loss.detach().item() * loss_scale_factor
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
+
+                        # Same KL over the WHOLE response, outside the graph. The KL brake
+                        # itself is deliberately left narrowed to the tokens that still get
+                        # a policy gradient; this is the number to watch for tail drift,
+                        # which by construction actor/kl_loss can no longer see.
+                        with torch.no_grad():
+                            if response_mask.any():
+                                full_kl = agg_loss(
+                                    loss_mat=kld,
+                                    loss_mask=response_mask,
+                                    loss_agg_mode=loss_agg_mode,
+                                )
+                                metrics["actor/kl_loss_full_response"] += (
+                                    full_kl.detach().item() * loss_scale_factor
+                                )
 
                     feedback_cfg = self.config.get("feedback_loss", None)
                     feedback_enabled = bool(getattr(feedback_cfg, "enabled", False)) if feedback_cfg is not None else False

@@ -19,12 +19,13 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import logging
 import os
+import re
 import uuid
 from collections import defaultdict
 from copy import deepcopy
 from pprint import pprint
-import re
 from typing import Any, Optional
 
 import numpy as np
@@ -66,6 +67,9 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
+logger = logging.getLogger(__file__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 def _object_array_1d(values):
@@ -178,6 +182,293 @@ def _span_overlaps(start: int, end: int, spans) -> bool:
     return any(start < int(span_end) and end > int(span_start) for span_start, span_end in spans or [])
 
 
+# Distinguishes "the byte table has not been built yet" from "it was built and is
+# unusable" (None). A plain sentinel string would be compared against a numpy array.
+_UNSET = object()
+
+# How many inconclusive batches the byte table may be validated over before the
+# truncation is given up on. Only batches in which NO row could be checked count.
+_LEAN_TAIL_VALIDATION_ATTEMPTS = 8
+
+# One-shot guard so the estimator warning below is not repeated every step.
+_LEAN_TAIL_ADV_WARNED = False
+
+
+def _as_int(value, default: int = -1) -> int:
+    """Read an int out of a non_tensor_batch cell, which is an object array."""
+    if isinstance(value, np.generic):
+        value = value.item()
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+# --------------------------------------------------------------------------------------
+# Mask truncation after the last CLOSED ```lean4 block.
+#
+# The reward reads exactly ONE thing out of a rollout: the last CLOSED lean block
+# (lean_code_utils._extract_last_lean_code). Nothing after that block's closing fence is
+# ever compiled, scored, or even looked at. GRPO nevertheless broadcasts the single scalar
+# advantage over EVERY generated token (compute_grpo_outcome_advantage:
+# scores.unsqueeze(-1) * response_mask, and compute_response_mask returns the whole
+# response), so those unread tokens carry gradient.
+#
+# The tail is NOT reinforced -- that reading is wrong and was measured to be wrong. A
+# rollout that derails almost never verifies (6 of 2852 verified rollouts carried a tail;
+# high-tail rows verified 0.000 at all 17 steps sampled), so the tail rides a NEGATIVE
+# advantage, dA -0.08 to -0.63. The problem is the opposite: there is no RESTORING force.
+# At step 165, 56 of 88 gibberish rows sat at advantage exactly 0.0, and 19 of 32 groups
+# held a clean row and a garbage row at identical score -- the group has nothing to prefer.
+# What little negative signal exists is then diluted by loss_agg_mode=seq-mean-token-mean,
+# which spreads a derailed rollout's gradient 14-26x thinner per token (1.08e-5 vs 2.78e-4
+# at step 165). So the degenerate mode neither pays nor gets corrected, and it plateaued at
+# 20-43% of rollouts for 36 steps instead of decaying.
+#
+# Measured: training-rollout gibberish went 1.2% -> 46.9% in two steps (128 -> 130),
+# entropy 0.019 -> 3.5, kl_loss 5.7e-03 -> 1.4e-01 -- but the trigger led the tail:
+# actor/ppo_kl broke its steps-95..119 range at step 120 while entropy was still 0.0189.
+# Optimizer divergence starts it; the unscored region is why it never recovers. Over steps
+# 100-125 (6656 rollouts) rollouts that never stopped cleanly verified 0.1% of the time
+# while burning a mean 9.29 closed blocks. Zeroing the mask here removes the dead zone and
+# stops it diluting the gradient of the part that is actually scored.
+#
+# The reward manager owns the fence parser (the abandoned-draft rule is not expressible as
+# a ``` count, and verl cannot import project code -- the manager is loaded by path into a
+# Ray actor), so the boundary crosses the process boundary as data: lean_last_block_end_byte,
+# a UTF-8 offset into the decoded response, positioned PAST the closing fence, with -1
+# meaning "no closed block". The trainer owns only the byte -> token index conversion.
+# --------------------------------------------------------------------------------------
+
+
+def build_token_byte_lengths(tokenizer) -> Optional[np.ndarray]:
+    """Bytes each token id contributes to `decode(ids, skip_special_tokens=True)`.
+
+    A byte-level BPE tokenizer (Qwen3) stores every token as its bytes run through the
+    GPT-2 byte->unicode map, which is one CHARACTER PER BYTE, so the surface length in the
+    vocab IS the byte length. Building this table once turns the offset -> token index
+    mapping into a cumsum + searchsorted over the ORIGINAL response ids: exact, cheap, and
+    free of the assumption the feedback-span path makes (_proof_action_response_mask
+    decodes, re-encodes, and trusts that offsets[i] lines up with responses[i]; it already
+    counts its own violations in feedback/generated_feedback_tokenizer_mismatch_rows).
+
+    Special ids contribute 0 so the table matches skip_special_tokens=True, which is what
+    the reward manager decoded with. Returns None when the tokenizer will not hand over a
+    vocab -- callers MUST then fail OPEN and truncate nothing.
+    """
+    try:
+        vocab = tokenizer.get_vocab()
+    except Exception:
+        return None
+    if not vocab:
+        return None
+
+    try:
+        size = max(int(max(vocab.values())) + 1, int(getattr(tokenizer, "vocab_size", 0) or 0))
+    except (TypeError, ValueError):
+        return None
+    if size <= 0:
+        return None
+
+    table = np.zeros(size, dtype=np.int32)
+    for token, token_id in vocab.items():
+        idx = int(token_id)
+        if 0 <= idx < size:
+            table[idx] = len(token)
+
+    # Added tokens are stored as literal text rather than byte-mapped, so their surface
+    # length is a CHARACTER count and can undercount bytes. Take their real encoding, and
+    # zero the special ones because skip_special_tokens=True drops them from the string.
+    for token_id, added in (getattr(tokenizer, "added_tokens_decoder", None) or {}).items():
+        idx = int(token_id)
+        if not (0 <= idx < size):
+            continue
+        if getattr(added, "special", False):
+            table[idx] = 0
+        else:
+            table[idx] = len(str(getattr(added, "content", added)).encode("utf-8"))
+    for special_id in getattr(tokenizer, "all_special_ids", None) or []:
+        idx = int(special_id)
+        if 0 <= idx < size:
+            table[idx] = 0
+
+    return table
+
+
+def token_byte_lengths_agree_with_decode(
+    tokenizer, table, responses, lengths, sample_rows: int = 8, scan_rows: int = 64
+):
+    """Check the byte table against real rows before trusting it for a whole run.
+
+    A non-byte-level tokenizer (sentencepiece stores "\u2581" for a space, one char for
+    one byte, but non-ASCII pieces are literal text) would produce a table that is subtly
+    wrong, and a subtly wrong table cuts at the wrong token -- silently dropping real proof
+    tokens from the gradient on a verified rollout. Cheaper to prove it once than to debug
+    it never.
+
+    Returns a TRI-STATE, and the caller must honour all three:
+      True  -- the table reproduces real rows; trust it.
+      False -- it demonstrably does not; disable the cut for the run.
+      None  -- this batch carried no checkable row; ask again on a later batch rather
+               than disabling the fix forever on one unlucky batch.
+
+    Two per-row conditions are skipped rather than treated as evidence against the table,
+    because a single such row used to disable the feature for an entire multi-day run:
+
+    * an id outside the table. The table is sized from the tokenizer vocab (151669 on
+      Qwen3) while the model config's vocab_size is larger (151936), so a sampled id can
+      legitimately land above it. lean_tail_response_mask already skips such a row per row
+      and counts it in fallback_rows.
+    * a decode containing U+FFFD. Generation cut at max_response_length ends mid-character
+      and decode then emits a 3-byte replacement where the table counts the 1 raw byte
+      (measured: table 50 vs decode 52 on a one-token-short row). The table UNDERCOUNTS
+      there, so the per-row cumsum lands LATE and the cut keeps extra tokens -- the safe
+      direction -- while an exact byte comparison is simply meaningless.
+
+    Both are most likely on exactly the collapsed batches this feature exists for, and on
+    the first batch after a resume-from-collapse, which is the batch that decides the run.
+    """
+    checked = 0
+    scanned = 0
+    for row_idx, valid_len in enumerate(lengths):
+        if checked >= sample_rows or scanned >= scan_rows:
+            break
+        valid_len = int(valid_len)
+        if valid_len <= 0:
+            continue
+        scanned += 1
+        ids = np.asarray(responses[row_idx, :valid_len]).astype(np.int64)
+        if ids.size == 0 or int(ids.max()) >= table.shape[0] or int(ids.min()) < 0:
+            continue
+        try:
+            text = tokenizer.decode(ids.tolist(), skip_special_tokens=True)
+        except Exception:
+            continue
+        if "\ufffd" in text:
+            continue
+        if int(table[ids].sum()) != len(text.encode("utf-8")):
+            return False
+        checked += 1
+    return True if checked > 0 else None
+
+
+def lean_tail_response_mask(
+    responses: torch.Tensor,
+    response_mask: torch.Tensor,
+    end_bytes,
+    token_byte_len,
+    eos_ids=(),
+    response_chars=None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Per-token keep mask: 1 up to the end of the last closed lean block, 0 after it.
+
+    Args:
+        responses: (bs, response_length) generated token ids.
+        response_mask: (bs, response_length) 1 for generated tokens, 0 for padding.
+        end_bytes: per-row UTF-8 offset PAST the closing fence of the last closed block.
+            -1 means NO CLOSED BLOCK and MUST be read as "keep the whole row".
+        token_byte_len: table from build_token_byte_lengths.
+        eos_ids: ids that end a generation; the terminal one is force-kept (see below).
+        response_chars: optional per-row character counts, used as a free drift guard.
+
+    Returns (mask, stats). The mask is bool and is meant to be composed MULTIPLICATIVELY
+    with response_mask / ppo_response_mask, never assigned over them.
+
+    Two rules are load-bearing:
+
+    * -1 keeps the FULL row. Zeroing a row that has no closed block would make it vanish
+      from the sequence average (agg_loss drops rows with seq_mask == 0), so the -0.10
+      no_lean_code penalty would produce no gradient at all and the exact degenerate mode
+      this change exists to punish would become unpunishable.
+    * The terminal EOS is force-kept. skip_special_tokens=True hides it from the decoded
+      string, so it always sorts after the boundary and a naive cut removes it -- deleting
+      all gradient on "stop here", which is the one behaviour the non-termination penalty
+      is trying to teach.
+
+    Every failure path fails OPEN (no truncation) and is counted, because a boundary that
+    lands EARLY silently starves real proof tokens on a verified rollout.
+    """
+    mask = torch.ones_like(response_mask, dtype=torch.bool)
+    stats = {
+        "rows": 0.0,
+        "truncated_rows": 0.0,
+        "no_block_rows": 0.0,
+        "fallback_rows": 0.0,
+        "masked_tokens": 0.0,
+        "response_tokens": 0.0,
+    }
+    if token_byte_len is None or end_bytes is None:
+        return mask, stats
+
+    table = np.asarray(token_byte_len)
+    vocab_size = int(table.shape[0])
+    eos = {int(token_id) for token_id in (eos_ids or ())}
+
+    responses_np = responses.detach().cpu().numpy()
+    lengths = response_mask.detach().sum(dim=1).long().cpu().numpy()
+    batch_size = int(responses_np.shape[0])
+
+    for row_idx in range(batch_size):
+        valid_len = int(lengths[row_idx])
+        stats["response_tokens"] += float(valid_len)
+        if valid_len <= 0:
+            continue
+        stats["rows"] += 1.0
+
+        end_byte = _as_int(end_bytes[row_idx], -1)
+        if end_byte < 0:
+            stats["no_block_rows"] += 1.0
+            continue
+
+        ids = responses_np[row_idx, :valid_len].astype(np.int64)
+        if int(ids.max()) >= vocab_size or int(ids.min()) < 0:
+            stats["fallback_rows"] += 1.0
+            continue
+
+        cumulative_bytes = np.cumsum(table[ids].astype(np.int64))
+        total_bytes = int(cumulative_bytes[-1])
+        if total_bytes <= 0 or end_byte > total_bytes:
+            # The boundary cannot exceed the row it was measured on. If it does, the two
+            # sides disagree about what this row says -- do nothing.
+            stats["fallback_rows"] += 1.0
+            continue
+        if response_chars is not None:
+            chars = _as_int(response_chars[row_idx], -1)
+            if 0 <= total_bytes < chars:
+                # UTF-8 is never fewer bytes than characters, so this can only mean the
+                # byte table is wrong for this vocabulary.
+                stats["fallback_rows"] += 1.0
+                continue
+
+        # cumulative_bytes[i] is the byte count THROUGH token i, so the first index whose
+        # cumulative count reaches end_byte is the token holding the boundary. Keep it
+        # whole: a boundary landing mid-token keeps one extra token rather than cutting a
+        # real one.
+        keep = int(np.searchsorted(cumulative_bytes, end_byte, side="left")) + 1
+        if keep >= valid_len:
+            continue
+
+        mask[row_idx, keep:] = False
+        masked = valid_len - keep
+        if int(responses_np[row_idx, valid_len - 1]) in eos:
+            mask[row_idx, valid_len - 1] = True
+            masked -= 1
+        if masked <= 0:
+            # The only token past the boundary was the terminal EOS, which is force-kept:
+            # NOTHING was removed from this row. Counting it would make
+            # mask/truncated_row_rate read ~1.0 on a perfectly clean batch -- every
+            # well-formed rollout ends "``` <EOS>" and the EOS carries 0 bytes under
+            # skip_special_tokens, so it always sorts past the boundary -- killing the one
+            # metric that has to answer "how many rollouts carried a garbage tail".
+            continue
+        stats["truncated_rows"] += 1.0
+        stats["masked_tokens"] += float(masked)
+
+    return mask, stats
+
+
 def compute_advantage(
     data: DataProto,
     adv_estimator: AdvantageEstimator,
@@ -208,6 +499,22 @@ def compute_advantage(
     # Back-compatible with trainers that do not compute response mask in fit
     if "response_mask" not in data.batch.keys():
         data.batch["response_mask"] = compute_response_mask(data)
+    # Only the GRPO branch below consumes lean_tail_mask. Swapping the estimator would
+    # otherwise disable the truncation silently, with every mask/* metric still reporting
+    # a cut that no longer reaches any advantage.
+    global _LEAN_TAIL_ADV_WARNED
+    if (
+        not _LEAN_TAIL_ADV_WARNED
+        and data.batch.get("lean_tail_mask", None) is not None
+        and adv_estimator != AdvantageEstimator.GRPO
+    ):
+        _LEAN_TAIL_ADV_WARNED = True
+        logger.warning(
+            "adv_estimator=%s does not consume lean_tail_mask; the mask truncation after the "
+            "last closed lean block does NOT reach the advantage in this branch.",
+            adv_estimator,
+        )
+
     # prepare response group
     if adv_estimator == AdvantageEstimator.GAE:
         # Compute advantages and returns using Generalized Advantage Estimation (GAE)
@@ -229,6 +536,20 @@ def compute_advantage(
     elif adv_estimator == AdvantageEstimator.GRPO:
         # Initialize the mask for GRPO calculation
         grpo_calculation_mask = data.batch["response_mask"]
+
+        # Do not hand the scalar advantage to tokens the reward never read. Everything
+        # after the last CLOSED ```lean4 block is invisible to the reward, so on a verified
+        # rollout it would otherwise collect the same +advantage as the proof itself.
+        # Composed multiplicatively and only over the tail: unlike ppo_response_mask this
+        # deliberately leaves the generated-feedback spans and the invalid-reward rows
+        # alone, since those are separate decisions with their own metrics.
+        # NOTE: the scalar per-row score is read as token_level_rewards.sum(-1) BEFORE any
+        # mask is applied (compute_grpo_outcome_advantage), and the reward is written at
+        # index valid_response_length-1 -- inside the truncated tail. Masking here changes
+        # only the broadcast, never the score. Do not start masking token_level_rewards.
+        lean_tail_mask = data.batch.get("lean_tail_mask", None)
+        if lean_tail_mask is not None:
+            grpo_calculation_mask = grpo_calculation_mask * lean_tail_mask.to(grpo_calculation_mask.dtype)
 
         # Call compute_grpo_outcome_advantage with parameters matching its definition
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
@@ -539,6 +860,57 @@ class RayPPOTrainer:
                 metrics[f"lean/status_rate/{status}"] = count / total
             metrics["lean/valid_proof_rate"] = statuses.count("verified") / total
             metrics["lean/infra_failure_rate"] = sum("infra" in str(status) for status in statuses) / total
+
+        # Self-repair rate: the fraction of rollouts that completed a SECOND attempt.
+        # Logged live because it is the earliest and sharpest collapse signal we have. In
+        # qwen3-lean-feedback-grpo-v2 it rose 0.4% -> 68.4% by step 120, then fell to 0.4% by
+        # step 150 -- and at step 150 it was 58% of VERIFIED proofs that had used 2+ attempts,
+        # so losing it is a capability loss. actor/entropy and actor/kl_loss only moved later
+        # and less sharply, which is why the collapse was not caught until step 200.
+        closed_blocks = numeric_values("lean_closed_blocks")
+        if closed_blocks:
+            n = len(closed_blocks)
+            metrics["lean/repair_rate"] = sum(1 for c in closed_blocks if c >= 2) / n
+            metrics["lean/attempts_mean"] = sum(closed_blocks) / n
+            metrics["lean/no_closed_block_rate"] = sum(1 for c in closed_blocks if c < 1) / n
+
+        # Reward SHAPING, separated from capability. lean/reward_mean is the PENALIZED
+        # score, so on the step this landed it steps down by up to 0.15 with no change in
+        # solving ability; without lean/base_reward_mean beside it a shaping-driven level
+        # shift and a real capability move are indistinguishable, and there is only one
+        # run in which to tell them apart.
+        base_scores = numeric_values("lean_base_score")
+        if base_scores:
+            metrics["lean/base_reward_mean"] = float(np.mean(base_scores))
+
+        penalty_totals = numeric_values("lean_penalty_total")
+        if penalty_totals:
+            metrics["lean/penalty_total_mean"] = float(np.mean(penalty_totals))
+            metrics["lean/penalized_rate"] = float(np.mean([p > 0 for p in penalty_totals]))
+
+        terminated_flags = reward_extra_infos_dict.get("lean_terminated", None)
+        if terminated_flags is not None and len(terminated_flags) > 0:
+            terminated_rate = float(np.mean([_truthy(v) for v in terminated_flags]))
+            metrics["lean/terminated_rate"] = terminated_rate
+            # The rate the non-termination penalty is actually charged at. Compare with
+            # lean/ends_with_eval_stop_rate: the two triggers were calibrated on different
+            # populations, so their divergence is worth watching on the first step.
+            metrics["lean/non_termination_rate"] = 1.0 - terminated_rate
+
+        eval_stop_flags = reward_extra_infos_dict.get("ends_with_eval_stop", None)
+        if eval_stop_flags is not None and len(eval_stop_flags) > 0:
+            metrics["lean/ends_with_eval_stop_rate"] = float(
+                np.mean([_truthy(v) for v in eval_stop_flags])
+            )
+
+        no_termination_charges = numeric_values("lean_no_termination_penalty")
+        if no_termination_charges:
+            metrics["lean/no_termination_penalty_mean"] = float(np.mean(no_termination_charges))
+
+        excess_charges = numeric_values("lean_excess_blocks_penalty")
+        if excess_charges:
+            metrics["lean/excess_block_penalty_mean"] = float(np.mean(excess_charges))
+            metrics["lean/excess_block_rate"] = float(np.mean([c > 0 for c in excess_charges]))
 
         error_kinds = [
             str(value)
@@ -876,6 +1248,15 @@ class RayPPOTrainer:
                     msgs, tokenize=True, add_generation_prompt=True, **apply_kwargs
                 )
             except TypeError:
+                # Retrying without apply_kwargs silently changes what the teacher is
+                # conditioned on (e.g. drops a chat_template override), so say so rather
+                # than degrading quietly.
+                logger.warning(
+                    "apply_chat_template rejected data.apply_chat_template_kwargs=%s; "
+                    "retrying WITHOUT them -- the teacher reprompt will use the tokenizer's "
+                    "own chat template, which may not match the policy's prompt format.",
+                    sorted(apply_kwargs),
+                )
                 ids = self.tokenizer.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True)
             return list(ids)
 
@@ -1052,6 +1433,174 @@ class RayPPOTrainer:
             metrics["feedback/generated_feedback_tokenizer_mismatch_rows"] = mismatch_rows
 
         return action_mask
+
+    def _lean_tail_eos_ids(self) -> frozenset:
+        """Ids that legitimately END a generation, used only to carve the EOS out of the cut.
+
+        Built by NAME rather than by guessing an id: an unknown string looked up in a
+        vocabulary that does not have it would either KeyError or, worse, resolve to some
+        live non-terminal token that then survives every truncation.
+        """
+        cached = getattr(self, "_lean_tail_eos_ids_cache", None)
+        if cached is not None:
+            return cached
+
+        ids: set[int] = set()
+        raw = getattr(self.tokenizer, "eos_token_id", None)
+        candidates = list(raw) if isinstance(raw, (list, tuple, set)) else [raw]
+        generation_config = getattr(self.tokenizer, "generation_config", None)
+        gen_eos = getattr(generation_config, "eos_token_id", None)
+        candidates += list(gen_eos) if isinstance(gen_eos, (list, tuple, set)) else [gen_eos]
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            try:
+                ids.add(int(candidate))
+            except (TypeError, ValueError):
+                continue
+
+        # Qwen3 chat ends a turn on <|im_end|>, which is not always tokenizer.eos_token_id.
+        try:
+            vocab = self.tokenizer.get_vocab() or {}
+        except Exception:
+            vocab = {}
+        for name in ("<|im_end|>", "<|endoftext|>"):
+            if name in vocab:
+                ids.add(int(vocab[name]))
+
+        self._lean_tail_eos_ids_cache = frozenset(ids)
+        return self._lean_tail_eos_ids_cache
+
+    def _lean_tail_response_mask(self, batch: DataProto, metrics: dict[str, Any]) -> torch.Tensor | None:
+        """Keep-mask that ends a response at its last CLOSED lean block; see
+        lean_tail_response_mask for the measured reason this exists.
+
+        Returns None whenever the truncation is off or cannot be done SAFELY, and the
+        caller then leaves every mask untouched. Failing open is the whole discipline
+        here: a boundary that lands early would drop real proof tokens from the gradient on
+        a verified rollout, and nothing downstream would read as anything worse than a run
+        that learns slowly.
+        """
+        # Written unconditionally so a flat line reads as "nothing was truncated" rather
+        # than "the metric stopped being emitted".
+        metrics["mask/truncated_token_rate"] = 0.0
+        metrics["mask/truncated_rows"] = 0.0
+        metrics["mask/truncated_row_rate"] = 0.0
+        metrics["mask/no_closed_block_rows"] = 0.0
+        metrics["mask/map_fallback_rows"] = 0.0
+        # 1.0 only when the cut actually ran this step. A disabled run is otherwise
+        # indistinguishable in W&B from a run in which nothing needed truncating.
+        metrics["mask/enabled"] = 0.0
+
+        algorithm_cfg = getattr(self.config, "algorithm", None)
+        try:
+            enabled = algorithm_cfg.get("mask_after_last_lean_block", True)
+        except AttributeError:
+            enabled = getattr(algorithm_cfg, "mask_after_last_lean_block", True)
+        if not _truthy(True if enabled is None else enabled):
+            return None
+
+        responses = batch.batch.get("responses", None)
+        response_mask = batch.batch.get("response_mask", None)
+        if responses is None or response_mask is None:
+            return None
+
+        end_bytes = batch.non_tensor_batch.get("lean_last_block_end_byte", None)
+        if end_bytes is None or len(end_bytes) != responses.shape[0]:
+            # No offsets means a reward manager that does not emit them. Silently doing
+            # nothing is correct, but say so once: this is also what a renamed key looks
+            # like, and a renamed key would disable the fix without failing anything.
+            if not getattr(self, "_lean_tail_missing_key_warned", False):
+                self._lean_tail_missing_key_warned = True
+                logger.warning(
+                    "lean_last_block_end_byte is absent from reward_extra_info; response-mask "
+                    "truncation after the last closed lean block is INACTIVE."
+                )
+            return None
+
+        table = getattr(self, "_lean_tail_byte_table", _UNSET)
+        if table is _UNSET:
+            table = build_token_byte_lengths(self.tokenizer)
+            self._lean_tail_byte_table = table
+        if table is None:
+            return None
+
+        if not getattr(self, "_lean_tail_byte_table_validated", False):
+            lengths = response_mask.detach().sum(dim=1).long().cpu().numpy()
+            verdict = token_byte_lengths_agree_with_decode(
+                self.tokenizer, table, responses.detach().cpu().numpy(), lengths
+            )
+            if verdict is False:
+                # Not a byte-level BPE vocabulary (or decode does not round-trip). Rather
+                # than cut at a guessed token, turn the feature off for the whole run.
+                self._lean_tail_byte_table = None
+                self._lean_tail_byte_table_validated = True
+                logger.warning(
+                    "byte-length table does not reproduce the decoded response for %s; "
+                    "mask truncation after the last closed lean block is DISABLED for this run.",
+                    type(self.tokenizer).__name__,
+                )
+                return None
+            if verdict is None:
+                # Nothing in THIS batch could be checked. Truncate nothing this step and
+                # ask again next step: disabling a multi-day run because one early batch
+                # happened to hold only mid-character or out-of-vocab rows is the worse
+                # failure, and it is near-silent (every mask/* metric just stays 0.0).
+                attempts = getattr(self, "_lean_tail_validation_attempts", 0) + 1
+                self._lean_tail_validation_attempts = attempts
+                if attempts >= _LEAN_TAIL_VALIDATION_ATTEMPTS:
+                    self._lean_tail_byte_table = None
+                    self._lean_tail_byte_table_validated = True
+                    logger.warning(
+                        "byte-length table could not be validated on any of %d batches for %s; "
+                        "mask truncation after the last closed lean block is DISABLED for this run.",
+                        attempts,
+                        type(self.tokenizer).__name__,
+                    )
+                else:
+                    logger.warning(
+                        "byte-length table validation was inconclusive on this batch (attempt %d/%d); "
+                        "truncating nothing this step.",
+                        attempts,
+                        _LEAN_TAIL_VALIDATION_ATTEMPTS,
+                    )
+                return None
+            self._lean_tail_byte_table_validated = True
+
+            # megatron_actor.py reads response_mask and has no ppo_response_mask fallback,
+            # so on Megatron this truncation -- like the existing feedback masking and the
+            # valid_reward row masking -- is a silent no-op.
+            try:
+                strategy = str(self.config.actor_rollout_ref.actor.get("strategy", "fsdp"))
+            except Exception:
+                strategy = "fsdp"
+            if "megatron" in strategy.lower():
+                logger.warning(
+                    "actor strategy is %r; the Megatron actor ignores ppo_response_mask, so the "
+                    "truncation after the last closed lean block will NOT reach the loss.",
+                    strategy,
+                )
+
+        tail_mask, stats = lean_tail_response_mask(
+            responses,
+            response_mask,
+            end_bytes,
+            table,
+            eos_ids=self._lean_tail_eos_ids(),
+            response_chars=batch.non_tensor_batch.get("response_chars", None),
+        )
+
+        rows = max(stats["rows"], 1.0)
+        response_tokens = max(stats["response_tokens"], 1.0)
+        metrics["mask/truncated_token_rate"] = stats["masked_tokens"] / response_tokens
+        metrics["mask/truncated_rows"] = stats["truncated_rows"]
+        metrics["mask/truncated_row_rate"] = stats["truncated_rows"] / rows
+        metrics["mask/no_closed_block_rows"] = stats["no_block_rows"]
+        # This one should sit at 0. Anything else means the two processes disagree about
+        # what a row says, and the truncation is quietly doing nothing on those rows.
+        metrics["mask/map_fallback_rows"] = stats["fallback_rows"]
+        metrics["mask/enabled"] = 1.0
+        return tail_mask
 
     def _tokenize_aux_target(self, text: str, max_response_len: int) -> tuple[list[int], list[tuple[int, int]], bool]:
         if not text:
@@ -1322,7 +1871,29 @@ class RayPPOTrainer:
                 aux_tensor = aux_position_ids
             elif key == "response_mask":
                 aux_tensor = aux_response_mask
+            elif key in ("teacher_input_ids", "teacher_attention_mask", "teacher_position_ids"):
+                # SDPO only. These are built BEFORE this function runs (fit() calls
+                # _maybe_build_self_distillation_batch first), so aux rows have no teacher
+                # tensors of their own. They must NOT be zeros: with use_remove_padding an
+                # all-zero attention mask unpads to ZERO tokens (cu_seqlens=[0,0]), and that
+                # degenerate forward is at best wasted work and at worst a NaN the later
+                # self_distillation_mask cannot undo (masking is applied after the fact, and
+                # 0 * NaN = NaN).
+                #
+                # Copying the source rollout's teacher tensors keeps the forward well-formed.
+                # Note we deliberately do NOT skip the teacher forward for these rows instead:
+                # it runs through the FSDP-wrapped module, so it is a collective, and rows are
+                # re-partitioned across ranks by sequence length
+                # (_balance_batch -> get_seqlen_balanced_partitions). At
+                # ppo_micro_batch_size_per_gpu=1 one rank could then skip a forward at the same
+                # loop index where another rank enters it, and the run deadlocks on the
+                # all-gather. Uniform control flow is worth the redundant compute.
+                aux_tensor = tensor.index_select(0, source_index.to(tensor.device)).clone()
             else:
+                # self_distillation_mask lands here and MUST stay zero: that is what excludes
+                # aux rows from the distillation loss. lean_tail_mask lands here too and the
+                # zeros are harmless -- it is consumed by compute_advantage, which has
+                # already run, and it is not in the actor's select_keys.
                 aux_tensor = torch.zeros_like(tensor.index_select(0, source_index.to(tensor.device)))
             tensors[key] = torch.cat([tensor, aux_tensor], dim=0)
 
@@ -2436,6 +3007,25 @@ class RayPPOTrainer:
                         proof_action_mask = self._proof_action_response_mask(batch, metrics)
                         if proof_action_mask is not None:
                             batch.batch["ppo_response_mask"] = proof_action_mask
+
+                        # Third narrowing factor on the PPO mask, after the generated
+                        # <feedback> spans and before the valid_reward row zeroing. Kept as
+                        # its own tensor so compute_advantage can use the tail cut alone,
+                        # and composed MULTIPLICATIVELY so the order of these three is
+                        # irrelevant -- assigning would clobber whichever ran first.
+                        #
+                        # Position matters twice: this is AFTER
+                        # _maybe_build_self_distillation_batch, so the SDPO teacher tensors
+                        # were built from an untouched response_mask (a holed
+                        # teacher_attention_mask over full teacher_input_ids renumbers
+                        # positions and, with use_remove_padding, drops tokens the student
+                        # still scores); and BEFORE _maybe_append_feedback_aux_batch, so the
+                        # aux rows inherit the composed mask instead of a rebuilt one.
+                        lean_tail_mask = self._lean_tail_response_mask(batch, metrics)
+                        if lean_tail_mask is not None:
+                            batch.batch["lean_tail_mask"] = lean_tail_mask
+                            base_ppo_mask = batch.batch.get("ppo_response_mask", batch.batch["response_mask"])
+                            batch.batch["ppo_response_mask"] = base_ppo_mask * lean_tail_mask.to(base_ppo_mask.dtype)
 
                         valid_reward_mask = _lean_valid_reward_mask(
                             reward_extra_infos_dict,

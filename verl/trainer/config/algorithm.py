@@ -608,9 +608,19 @@ class AlgoConfig(BaseConfig):
     # Lower bound on the GRPO group std. 0.0 disables it. See
     # compute_grpo_outcome_advantage for why 1/sqrt(G) is the principled value.
     grpo_adv_std_floor: float = 0.0
-    # Zero the PPO response mask after the last CLOSED ```lean4 block. The reward only
-    # ever reads that block, yet GRPO broadcasts the scalar advantage over every generated
-    # token, so a verified rollout reinforces its own trailing garbage. Defaults ON; set
+    # Refund the Lean excess-attempt penalty inside GRPO groups where NO rollout verified.
+    # In such a group the attempt penalty is the only thing separating rollouts, so
+    # normalisation rescales it to full strength and it teaches "give up" on the problems
+    # not yet solved (measured corr(attempts, advantage) = -0.552 over steps 100-125).
+    # Applied to the pre-normalisation scalar; normalisation is non-linear, so a
+    # correction applied after it cannot reproduce this. Defaults ON; set False for
+    # byte-identical pre-fix behaviour. See core_algos.compute_grpo_outcome_advantage.
+    neutralize_attempt_penalty_in_all_fail_groups: bool = True
+    # Zero the PPO response mask after the last CLOSED ```lean4 block, keeping exactly ONE
+    # token past it. The reward only ever reads that block, yet GRPO broadcasts the scalar
+    # advantage over every generated token, so a verified rollout reinforces its own
+    # trailing garbage. The one kept token is what makes stopping learnable: on a clean
+    # rollout it is the EOS, on a derailed one the first garbage token. Defaults ON; set
     # False to reproduce the pre-fix behaviour. See ray_trainer.lean_tail_response_mask.
     mask_after_last_lean_block: bool = True
     use_kl_in_reward: bool = False

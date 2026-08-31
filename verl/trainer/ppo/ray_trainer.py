@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import logging
+import math
 import os
 import re
 import uuid
@@ -153,6 +154,104 @@ def _lean_valid_reward_mask(reward_extra_infos_dict: dict, length: int, device: 
     return torch.tensor([_truthy(flag) for flag in valid_flags], dtype=torch.bool, device=device)
 
 
+# The one status string that means "this rollout proved the requested theorem". It has a
+# single producer in the reward. Deliberately NOT derived from the score: score > 0 is
+# also true of renamed_declaration (0.7, the right statement under the wrong name), and
+# score == 1.0 is false for every verified rollout that paid any shaping penalty -- the
+# worst verified row scores 0.55.
+_LEAN_VERIFIED_STATUS = "verified"
+
+
+def _lean_attempt_penalty_inputs(
+    data: DataProto, length: int, device: torch.device
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Per-row inputs for the all-fail-group attempt-penalty refund, or (None, None).
+
+    Two columns, both already emitted unconditionally on EVERY row by the Lean reward, so
+    this adds no key to reward_extra_info (a conditionally-present key kills the run --
+    reward_extra_keys is read off row 0 and every row is then indexed by every key):
+
+      * ``lean_excess_blocks_penalty`` -- the amount APPLIED to this row. Two neighbours
+        in the same dict literal are wrong in ways nothing would report.
+        ``lean_excess_blocks_penalty_coef`` is the knob, the same constant on every row,
+        and a constant cancels exactly in ``score - group_mean``: advantages would come
+        out bit-identical to today while the added-back metric reported a healthy 0.02.
+        ``lean_penalty_total`` also carries the non-termination and give-up charges, so
+        refunding it would cancel the give-up penalty inside precisely the all-fail
+        groups that penalty was added to fix. The measured target for all-fail groups is
+        corr(attempts, advantage) = -0.009 and NOT 0.000; that residual is the
+        non-termination penalty, still correlating with attempts, and it is the
+        arithmetic proof that only the excess term may be refunded.
+      * ``lean_status`` -- the unshaped verdict; see _LEAN_VERIFIED_STATUS.
+
+    Read out of ``data.non_tensor_batch`` at the point of USE rather than cached earlier
+    in the step: rejection sampling can reindex the batch between the reward and the
+    advantage, and a tensor parked in ``batch.batch`` would be silently misaligned.
+
+    FAILS OPEN. Any missing, short or unparseable column returns (None, None) and
+    disables the refund for this batch, leaving the advantage path exactly as it was.
+    Failing the other way -- treating rows as not-verified -- would neutralise EVERY
+    group in the batch, the loudest possible wrong answer. The caller reports a disabled
+    batch as ``lean/attempt_penalty_neutralize_unavailable = 1.0``, so a permanently
+    inert feature is visible rather than inferred from a flat curve.
+    """
+    non_tensor = getattr(data, "non_tensor_batch", None)
+    if not non_tensor:
+        return None, None
+    penalties = non_tensor.get("lean_excess_blocks_penalty", None)
+    statuses = non_tensor.get("lean_status", None)
+    if penalties is None or statuses is None:
+        return None, None
+    if len(penalties) != length or len(statuses) != length:
+        return None, None
+
+    amounts: list[float] = []
+    for raw in penalties:
+        if isinstance(raw, np.generic):
+            raw = raw.item()
+        try:
+            amount = float(raw)
+        except (TypeError, ValueError):
+            return None, None
+        # A NaN refund would poison its whole group's mean and std, taking every row in
+        # the group down with it; a negative one would charge a penalty never paid.
+        if not math.isfinite(amount) or amount < 0.0:
+            return None, None
+        amounts.append(amount)
+
+    flags: list[bool] = []
+    for raw in statuses:
+        if isinstance(raw, np.generic):
+            raw = raw.item()
+        if not isinstance(raw, str) or not raw:
+            # A column that is not strings is not the status column. Reading it anyway
+            # would mark every row not-verified and neutralise the whole batch.
+            return None, None
+        flags.append(raw.strip().lower() == _LEAN_VERIFIED_STATUS)
+
+    return (
+        torch.tensor(amounts, dtype=torch.float32, device=device),
+        torch.tensor(flags, dtype=torch.bool, device=device),
+    )
+
+
+def _neutralize_attempt_penalty_enabled(config) -> bool:
+    """Read algorithm.neutralize_attempt_penalty_in_all_fail_groups (declared default ON).
+
+    Declared in the AlgoConfig dataclass and in BOTH trainer yamls so no leading ``+`` is
+    needed at launch -- a key missing from the schema makes a plain Hydra override a
+    struct error. With no algorithm config at all there is no declared default to honour,
+    so the advantage path is left exactly as it was.
+    """
+    if config is None:
+        return False
+    try:
+        raw = config.get("neutralize_attempt_penalty_in_all_fail_groups", True)
+    except AttributeError:
+        raw = getattr(config, "neutralize_attempt_penalty_in_all_fail_groups", True)
+    return _truthy(raw)
+
+
 _GENERATED_FEEDBACK_BLOCK_RES = [
     re.compile(r"--\s*<feedback>\n[\s\S]*?--\s*</feedback>\n?", re.MULTILINE),
     re.compile(r"/-\s*<feedback>\n[\s\S]*?</feedback>\s*-/\n?", re.MULTILINE),
@@ -190,8 +289,9 @@ _UNSET = object()
 # truncation is given up on. Only batches in which NO row could be checked count.
 _LEAN_TAIL_VALIDATION_ATTEMPTS = 8
 
-# One-shot guard so the estimator warning below is not repeated every step.
+# One-shot guards so the estimator warnings below are not repeated every step.
 _LEAN_TAIL_ADV_WARNED = False
+_LEAN_ATTEMPT_NEUTRALIZE_ADV_WARNED = False
 
 
 def _as_int(value, default: int = -1) -> int:
@@ -239,7 +339,9 @@ def _as_int(value, default: int = -1) -> int:
 # a ``` count, and verl cannot import project code -- the manager is loaded by path into a
 # Ray actor), so the boundary crosses the process boundary as data: lean_last_block_end_byte,
 # a UTF-8 offset into the decoded response, positioned PAST the closing fence, with -1
-# meaning "no closed block". The trainer owns only the byte -> token index conversion.
+# meaning "no closed block". The trainer owns only the byte -> token index conversion,
+# plus the ONE token of grace it keeps past that index so that "what follows a closing
+# fence" stays in the gradient at all -- see lean_tail_response_mask's third rule.
 # --------------------------------------------------------------------------------------
 
 
@@ -295,6 +397,151 @@ def build_token_byte_lengths(tokenizer) -> Optional[np.ndarray]:
             table[idx] = 0
 
     return table
+
+
+# The whitespace a rollout is allowed to put between its closing fence and its EOS,
+# mirroring the reward's LEAN_MAX_TRAILING_WS (lean_code_utils.DEFAULT_MAX_TRAILING_WS).
+# The trainer reads the SAME environment variable the reward manager reads rather than
+# taking a second Hydra key, because two knobs for one rule is how they drift: a run that
+# lowered the reward's allowance would otherwise keep force-keeping the EOS behind padding
+# the reward had already stopped calling terminated.
+_LEAN_MAX_TRAILING_WS_DEFAULT = 3
+
+# ASCII whitespace bytes only. The reward's rule is unicode-aware (a trailing NBSP still
+# counts as terminated), but the trainer sees BYTES and a byte table, and treating a
+# multi-byte whitespace character as prose only ever makes this stricter: the EOS behind
+# it loses its force-keep. Erring that way costs one stop-token gradient on a rollout that
+# padded its proof with invisible characters; erring the other way is what this rule
+# exists to stop.
+_ASCII_WS_BYTES = frozenset(b" \t\n\r\x0b\x0c")
+
+
+def _gpt2_byte_decoder() -> dict:
+    """Inverse of the GPT-2 byte->unicode map: one surface CHARACTER back to one byte.
+
+    Built here rather than imported so this file does not acquire a transformers
+    internals dependency for fifteen deterministic lines. It is the same map
+    build_token_byte_lengths already relies on -- that function trusts len(surface) to BE
+    the byte length, which is only true because the map is one character per byte.
+    """
+    printable = (
+        list(range(ord("!"), ord("~") + 1))
+        + list(range(ord("\u00a1"), ord("\u00ac") + 1))
+        + list(range(ord("\u00ae"), ord("\u00ff") + 1))
+    )
+    mapped = printable[:]
+    extra = 0
+    for byte in range(256):
+        if byte not in printable:
+            printable.append(byte)
+            mapped.append(256 + extra)
+            extra += 1
+    return {chr(code): byte for byte, code in zip(printable, mapped)}
+
+
+def build_token_trailing_ws_bytes(tokenizer, token_byte_len) -> Optional[np.ndarray]:
+    """Bytes of ASCII whitespace at the END of each token's contribution to the decode.
+
+    Parallel to build_token_byte_lengths, sized identically, and read together with it:
+    a token is ENTIRELY whitespace exactly when its trailing run covers its whole byte
+    length. That makes every special id trivially whitespace (0 == 0), which is the right
+    answer -- skip_special_tokens=True means they are not in the string the reward
+    measured at all, so they cannot be the thing separating a fence from an EOS.
+
+    Only the END of the token is measured because that is the only part that can be
+    "after the fence": the boundary routinely lands INSIDE a token (Qwen3 merges the
+    closing fence with the newlines behind it into one "```\\n\\n"), and what matters then
+    is whether the part past the boundary is whitespace, not the whole token.
+
+    Returns None when the tokenizer will not hand over a vocab, and the caller MUST then
+    fail OPEN -- keeping the terminal EOS wherever it lands, exactly as before the
+    adjacency rule. A missing table is not evidence of a garbage tail.
+    """
+    if token_byte_len is None:
+        return None
+    try:
+        vocab = tokenizer.get_vocab()
+    except Exception:
+        return None
+    if not vocab:
+        return None
+
+    table = np.asarray(token_byte_len)
+    size = int(table.shape[0])
+    if size <= 0:
+        return None
+
+    ws = np.zeros(size, dtype=np.int32)
+    decoder = _gpt2_byte_decoder()
+    for token, token_id in vocab.items():
+        idx = int(token_id)
+        if not (0 <= idx < size):
+            continue
+        run = 0
+        for char in reversed(token):
+            byte = decoder.get(char)
+            if byte is None or byte not in _ASCII_WS_BYTES:
+                break
+            run += 1
+        ws[idx] = run
+
+    # Same two corrections build_token_byte_lengths makes, for the same reasons: added
+    # tokens are stored as literal text rather than byte-mapped, and special ids
+    # contribute nothing to the decoded string.
+    for token_id, added in (getattr(tokenizer, "added_tokens_decoder", None) or {}).items():
+        idx = int(token_id)
+        if not (0 <= idx < size):
+            continue
+        if getattr(added, "special", False):
+            ws[idx] = 0
+            continue
+        run = 0
+        for byte in reversed(str(getattr(added, "content", added)).encode("utf-8")):
+            if byte not in _ASCII_WS_BYTES:
+                break
+            run += 1
+        ws[idx] = run
+    for special_id in getattr(tokenizer, "all_special_ids", None) or []:
+        idx = int(special_id)
+        if 0 <= idx < size:
+            ws[idx] = 0
+
+    return ws
+
+
+def _tail_after_fence_is_permitted_whitespace(
+    ids, cumulative_bytes, byte_table, ws_table, end_byte, boundary, eos_index, max_trailing_ws
+) -> bool:
+    """Is everything between the closing fence and the terminal EOS permitted whitespace?
+
+    "Everything" is three pieces, and all three have to be checked or the answer is a
+    guess: the part of the BOUNDARY token that sits past the fence (the fused "```\\n\\n"
+    case), every whole token between it and the EOS (the one token of grace included --
+    it is kept either way, but it is still part of the tail being judged), and the total
+    length of that run.
+
+    Bytes stand in for characters in the length bound. Every character is at least one
+    byte, so a byte count can only OVER-estimate how many characters the tail holds, and
+    over-estimating means refusing to force-keep -- the strict direction. For the ASCII
+    whitespace this table recognises at all, the two counts are identical anyway.
+    """
+    total_bytes = int(cumulative_bytes[-1])
+    trailing = total_bytes - end_byte
+    if trailing < 0 or trailing > max_trailing_ws:
+        # Checked FIRST because it is O(1) and it is what rejects the shape this rule
+        # exists for: a 5000-token garbage tail fails here without touching the tokens.
+        return False
+
+    suffix = int(cumulative_bytes[boundary]) - end_byte
+    if suffix > int(ws_table[ids[boundary]]):
+        # The boundary token continues past the fence with something that is not
+        # whitespace, e.g. "```" fused onto the first word of the tail.
+        return False
+
+    span = ids[boundary + 1 : eos_index]
+    if span.size and not np.array_equal(ws_table[span], byte_table[span]):
+        return False
+    return True
 
 
 def token_byte_lengths_agree_with_decode(
@@ -361,8 +608,10 @@ def lean_tail_response_mask(
     token_byte_len,
     eos_ids=(),
     response_chars=None,
+    token_trailing_ws=None,
+    max_trailing_ws: int = _LEAN_MAX_TRAILING_WS_DEFAULT,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Per-token keep mask: 1 up to the end of the last closed lean block, 0 after it.
+    """Per-token keep mask: 1 through ONE token past the last closed lean block, 0 after.
 
     Args:
         responses: (bs, response_length) generated token ids.
@@ -370,22 +619,84 @@ def lean_tail_response_mask(
         end_bytes: per-row UTF-8 offset PAST the closing fence of the last closed block.
             -1 means NO CLOSED BLOCK and MUST be read as "keep the whole row".
         token_byte_len: table from build_token_byte_lengths.
-        eos_ids: ids that end a generation; the terminal one is force-kept (see below).
+        eos_ids: ids that end a generation; the terminal one is force-kept only where it
+            is adjacent to what was kept (see below).
         response_chars: optional per-row character counts, used as a free drift guard.
+        token_trailing_ws: table from build_token_trailing_ws_bytes, deciding whether the
+            run between a closing fence and the EOS is whitespace. None fails OPEN: the
+            terminal EOS is then force-kept wherever it lands, as it was before.
+        max_trailing_ws: how much of that whitespace is permitted, in bytes. Mirrors the
+            reward's LEAN_MAX_TRAILING_WS, which is the allowance a rollout can pad its
+            proof with and still be scored TERMINATED.
 
     Returns (mask, stats). The mask is bool and is meant to be composed MULTIPLICATIVELY
     with response_mask / ppo_response_mask, never assigned over them.
 
-    Two rules are load-bearing:
+    Three rules are load-bearing:
 
     * -1 keeps the FULL row. Zeroing a row that has no closed block would make it vanish
       from the sequence average (agg_loss drops rows with seq_mask == 0), so the -0.10
       no_lean_code penalty would produce no gradient at all and the exact degenerate mode
       this change exists to punish would become unpunishable.
-    * The terminal EOS is force-kept. skip_special_tokens=True hides it from the decoded
-      string, so it always sorts after the boundary and a naive cut removes it -- deleting
-      all gradient on "stop here", which is the one behaviour the non-termination penalty
-      is trying to teach.
+    * The terminal EOS is force-kept ONLY where it is ADJACENT to what was kept, or
+      separated from the closing fence by nothing but permitted whitespace (at most
+      max_trailing_ws bytes of it -- the same allowance the reward's termination rule
+      gives, read from the same knob). skip_special_tokens=True hides the EOS from the
+      decoded string, so it always sorts after the boundary and a naive cut removes it --
+      deleting all gradient on "stop here", which is the one behaviour the non-termination
+      penalty is trying to teach.
+
+      An UNCONDITIONAL carve-out, though, is worse than the disease on the shape it was
+      not written for. "Closing fence + 5000 garbage tokens + EOS" leaves exactly two
+      islands of gradient in the row, the proof and that EOS, and the EOS collects the
+      ROW's scalar advantage. A derailed row sits BELOW its group mean (it pays the
+      non-termination penalty, and rollouts that never stop cleanly verify 0.1% of the
+      time), so that advantage is NEGATIVE and the force-keep spends it teaching the
+      policy NOT to emit its stop token -- inside the same loss whose stated purpose is
+      to teach it to stop. Masking the distant EOS costs nothing the row was owed: it
+      still pays the penalty through its score, it simply stops carrying a gradient
+      against stopping.
+
+      Failing open here means KEEPING the EOS. With no whitespace table (a tokenizer
+      that will not hand over a usable vocab) the trainer cannot tell padding from prose,
+      and deleting a real stop token is the more expensive mistake. Rows whose EOS is
+      dropped are counted in eos_masked_rows.
+    * ONE token past the boundary token is kept, always. That token is the model's answer
+      to "what comes after a closing fence", and it is the only token in the row that can
+      carry that gradient: on a clean rollout it IS the EOS (reinforced on a verified
+      proof, rather than merely spared by the force-keep above), and on a derailed one it
+      is the first token of the garbage tail (pushed DOWN whenever the row sits below its
+      group mean, which is where the non-termination penalty puts it). Cutting at the
+      boundary instead leaves the closing fence as the last token with a gradient, and
+      then nothing in the loss ever says whether to stop -- the non-termination penalty
+      would be pricing a behaviour the mask had already made unlearnable.
+
+      KNOWN AND ACCEPTED EXPOSURE: a rollout that VERIFIES but does not terminate scores
+      1.0 - 0.05 = 0.95, keeps a positive advantage, and therefore has its first GARBAGE
+      token reinforced.
+
+      Frequency, with the denominator stated because the two available measurements do
+      not share one. "Not terminated" USED to mean "ran to the generation cap", and those
+      rows verify 0.1% of the time (steps 100-125, 6656 rollouts). Under the strict
+      trigger it also covers rows that stopped cleanly on EOS but wrote a tail past their
+      proof, and those are drawn from the stop-cleanly population, which verifies 44.6%
+      of the time -- a completely different distribution, so the 0.1% is a floor and not
+      the answer. The repo's own direct count of the new shape is the closer one: 6 of
+      2852 verified rollouts carried a tail, 0.21% (lean_code_utils.last_closed_lean_block_end).
+      Expect roughly 2-3x the old figure, and expect lean/verified_not_terminated_rate to
+      read HIGHER than 0.1% on the first step purely from the definition change.
+
+      Accepted deliberately at that size as the cost of making termination learnable at
+      all. lean/verified_not_terminated_rate is the series to watch, and its denominator
+      is the whole batch, not non-terminated rows.
+
+      A second population sits inside the same rule and is NOT covered by that metric:
+      the claim above that the garbage token is "pushed down" assumes the row is below
+      its group mean, and a flat 0.05 does not guarantee that. Rows with no closed block
+      are never truncated (end_byte == -1) but still enter the group at -0.15, so in an
+      all-failure group a closed-block row at -0.05 sits ABOVE the mean and has its first
+      tail token reinforced too. That is larger than the verified slice and only the
+      verified slice is measured.
 
     Every failure path fails OPEN (no truncation) and is counted, because a boundary that
     lands EARLY silently starves real proof tokens on a verified rollout.
@@ -396,6 +707,7 @@ def lean_tail_response_mask(
         "truncated_rows": 0.0,
         "no_block_rows": 0.0,
         "fallback_rows": 0.0,
+        "eos_masked_rows": 0.0,
         "masked_tokens": 0.0,
         "response_tokens": 0.0,
     }
@@ -405,6 +717,17 @@ def lean_tail_response_mask(
     table = np.asarray(token_byte_len)
     vocab_size = int(table.shape[0])
     eos = {int(token_id) for token_id in (eos_ids or ())}
+
+    # A table of the wrong size cannot be indexed by the same ids, so treat it as absent
+    # rather than half-trusting it: absent means the EOS carve-out behaves as it did
+    # before the adjacency rule, which is the failing-open direction.
+    ws_table = None if token_trailing_ws is None else np.asarray(token_trailing_ws)
+    if ws_table is not None and int(ws_table.shape[0]) != vocab_size:
+        ws_table = None
+    try:
+        max_trailing_ws = max(int(max_trailing_ws), 0)
+    except (TypeError, ValueError):
+        max_trailing_ws = _LEAN_MAX_TRAILING_WS_DEFAULT
 
     responses_np = responses.detach().cpu().numpy()
     lengths = response_mask.detach().sum(dim=1).long().cpu().numpy()
@@ -438,7 +761,21 @@ def lean_tail_response_mask(
             chars = _as_int(response_chars[row_idx], -1)
             if 0 <= total_bytes < chars:
                 # UTF-8 is never fewer bytes than characters, so this can only mean the
-                # byte table is wrong for this vocabulary.
+                # byte table is wrong for this vocabulary. This direction is the SAFE one
+                # -- an under-reporting table makes the cumulative sum reach end_byte
+                # LATE, so the boundary lands late and extra tokens are kept -- and it is
+                # caught anyway because a guard that only fires on the harmless half of a
+                # symmetric impossibility is not a guard.
+                stats["fallback_rows"] += 1.0
+                continue
+            if chars >= 0 and total_bytes > 4 * chars:
+                # The other half, and the half that can silently eat a proof: UTF-8 is at
+                # most 4 bytes per character, so an OVER-reporting table is equally
+                # impossible. Its failure mode is the dangerous one -- the cumulative sum
+                # reaches end_byte EARLY, the boundary is placed early, and the END OF A
+                # VALID PROOF is masked off with nothing firing. Same treatment: fail
+                # open, count it, and let mask/map_fallback_rows say the two sides
+                # disagree about what this row says.
                 stats["fallback_rows"] += 1.0
                 continue
 
@@ -447,19 +784,49 @@ def lean_tail_response_mask(
         # whole: a boundary landing mid-token keeps one extra token rather than cutting a
         # real one.
         keep = int(np.searchsorted(cumulative_bytes, end_byte, side="left")) + 1
-        if keep >= valid_len:
+
+        # keep is a COUNT of kept tokens, so keep + 1 is the first index dropped: the
+        # boundary token, plus the one token after it (see the third rule above), survive.
+        cut = keep + 1
+        if cut >= valid_len:
+            # Nothing sits past the extra kept token. Note this is the ordinary clean
+            # shape "``` <EOS>", not an edge case: it must leave the row untouched AND
+            # uncounted, or mask/truncated_row_rate reads ~1.0 on a perfect batch.
             continue
 
-        mask[row_idx, keep:] = False
-        masked = valid_len - keep
-        if int(responses_np[row_idx, valid_len - 1]) in eos:
-            mask[row_idx, valid_len - 1] = True
-            masked -= 1
+        mask[row_idx, cut:] = False
+        masked = valid_len - cut
+        last_idx = valid_len - 1
+        if int(responses_np[row_idx, last_idx]) in eos:
+            # ADJACENCY, not "wherever it landed" -- see the second rule above. An EOS
+            # behind a garbage tail is the only token of that tail still carrying a
+            # gradient, and on a below-mean row that gradient trains the policy not to
+            # stop. last_idx <= cut is the EOS sitting immediately after the kept region;
+            # the whitespace path is the row that padded its proof and stopped, which the
+            # reward still scores as TERMINATED and which must keep its stop gradient.
+            if (
+                last_idx <= cut
+                or ws_table is None
+                or _tail_after_fence_is_permitted_whitespace(
+                    ids,
+                    cumulative_bytes,
+                    table,
+                    ws_table,
+                    end_byte,
+                    keep - 1,
+                    last_idx,
+                    max_trailing_ws,
+                )
+            ):
+                mask[row_idx, last_idx] = True
+                masked -= 1
+            else:
+                stats["eos_masked_rows"] += 1.0
         if masked <= 0:
-            # The only token past the boundary was the terminal EOS, which is force-kept:
-            # NOTHING was removed from this row. Counting it would make
-            # mask/truncated_row_rate read ~1.0 on a perfectly clean batch -- every
-            # well-formed rollout ends "``` <EOS>" and the EOS carries 0 bytes under
+            # The only token past the extra kept one was the terminal EOS, which is
+            # force-kept: NOTHING was removed from this row. Counting it would make
+            # mask/truncated_row_rate read ~1.0 on a nearly clean batch -- a well-formed
+            # rollout ends "```\n<EOS>" and the EOS carries 0 bytes under
             # skip_special_tokens, so it always sorts past the boundary -- killing the one
             # metric that has to answer "how many rollouts carried a garbage tail".
             continue
@@ -514,6 +881,23 @@ def compute_advantage(
             "last closed lean block does NOT reach the advantage in this branch.",
             adv_estimator,
         )
+    # Same failure mode for the all-fail-group refund: only the GRPO branch below passes
+    # it through, and grpo_vectorized takes neither valid_reward_mask nor these arguments.
+    # Without this the feature would silently stop applying on an estimator swap while
+    # every lean/attempt_penalty_* series kept reporting from a previous run's shape.
+    global _LEAN_ATTEMPT_NEUTRALIZE_ADV_WARNED
+    if (
+        not _LEAN_ATTEMPT_NEUTRALIZE_ADV_WARNED
+        and adv_estimator != AdvantageEstimator.GRPO
+        and _neutralize_attempt_penalty_enabled(config)
+        and "lean_excess_blocks_penalty" in getattr(data, "non_tensor_batch", {})
+    ):
+        _LEAN_ATTEMPT_NEUTRALIZE_ADV_WARNED = True
+        logger.warning(
+            "adv_estimator=%s does not consume the Lean attempt-penalty refund; "
+            "algorithm.neutralize_attempt_penalty_in_all_fail_groups has NO effect in this branch.",
+            adv_estimator,
+        )
 
     # prepare response group
     if adv_estimator == AdvantageEstimator.GAE:
@@ -551,6 +935,32 @@ def compute_advantage(
         if lean_tail_mask is not None:
             grpo_calculation_mask = grpo_calculation_mask * lean_tail_mask.to(grpo_calculation_mask.dtype)
 
+        # (D) Refund the excess-attempt penalty inside groups that solved nothing. The
+        # two per-row columns are read here, the last point before use, and the group
+        # decision itself is made inside compute_grpo_outcome_advantage so that it shares
+        # one definition of group membership with the loop that builds the groups -- see
+        # the block above id2score there. Both columns are None when the flag is off, and
+        # then the estimator takes its previous code path exactly.
+        attempt_penalty = None
+        verified = None
+        neutralize_stats: dict[str, float] | None = None
+        if _neutralize_attempt_penalty_enabled(config):
+            token_level_rewards = data.batch["token_level_rewards"]
+            attempt_penalty, verified = _lean_attempt_penalty_inputs(
+                data, token_level_rewards.shape[0], token_level_rewards.device
+            )
+            neutralize_stats = {}
+            if (attempt_penalty is None or verified is None) and any(
+                key.startswith("lean_") for key in getattr(data, "non_tensor_batch", {})
+            ):
+                # The refund is disabled for this batch. Say so as a metric rather than
+                # leaving it to be guessed from a flat neutralised-group rate. Gated on
+                # the batch carrying SOME lean_ column, so an upstream non-Lean run does
+                # not log a lean/ metric on every step just because the flag defaults on;
+                # any regression that drops one of the two columns still trips it, because
+                # lean_valid_reward and the rest of the reward's extra info remain.
+                neutralize_stats["lean/attempt_penalty_neutralize_unavailable"] = 1.0
+
         # Call compute_grpo_outcome_advantage with parameters matching its definition
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
@@ -559,11 +969,20 @@ def compute_advantage(
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
             valid_reward_mask=data.batch.get("valid_reward_mask", None),
             # Must be forwarded: without it grpo_adv_std_floor silently stays 0.0 and
-            # the group-std floor never activates.
+            # the group-std floor never activates. The same hazard applies to the
+            # attempt-penalty flag, which is read off this very object.
             config=config,
+            attempt_penalty=attempt_penalty,
+            verified=verified,
+            neutralize_stats=neutralize_stats,
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+        if neutralize_stats:
+            # Handed back through meta_info because compute_advantage returns a DataProto,
+            # not a metrics dict. The caller pops it in the same 'adv' timer block, so the
+            # metric lands on the step it describes.
+            data.meta_info["lean_attempt_neutralize_stats"] = neutralize_stats
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -874,6 +1293,78 @@ class RayPPOTrainer:
             metrics["lean/attempts_mean"] = sum(closed_blocks) / n
             metrics["lean/no_closed_block_rate"] = sum(1 for c in closed_blocks if c < 1) / n
 
+        # ATTEMPTS STARTED, closed or abandoned -- the count the excess-block ramp is
+        # priced on, which lean/attempts_mean above is NOT. The gap between them is the
+        # whole reason this metric exists: dropping the intermediate closing fences turns
+        # eight attempts into one closed block with an identical scored body, an
+        # identical Lean verdict and an identical mask boundary. That dodge is now priced
+        # (lean_code_utils.lean_block_attempt_count), but if it ever appears anyway it is
+        # invisible everywhere else -- lean/attempts_mean FALLS, lean/repair_rate FALLS
+        # and lean/penalized_rate FALLS, so the batch reads as a policy that learned to
+        # be concise. lean/unclosed_block_rate is the only series that rises.
+        #
+        # It also silently disables the tail mask on the same rows: no closed block means
+        # lean_last_block_end_byte == -1, which is the fail-open path, so watch this
+        # against mask/no_closed_block_rows.
+        attempt_blocks = numeric_values("lean_block_attempts")
+        if attempt_blocks:
+            n = len(attempt_blocks)
+            metrics["lean/attempt_blocks_mean"] = sum(attempt_blocks) / n
+            if len(closed_blocks) == n:
+                unclosed = [a - c for a, c in zip(attempt_blocks, closed_blocks, strict=True)]
+                metrics["lean/unclosed_blocks_mean"] = sum(unclosed) / n
+                metrics["lean/unclosed_block_rate"] = sum(1 for u in unclosed if u > 0) / n
+
+        # In-fence comment volume, in non-whitespace characters of the last closed block.
+        #
+        # The shaping this sits beside charges a tail AFTER the closing fence 0.05 and
+        # masks it out of the gradient. The identical text as a /- ... -/ comment INSIDE
+        # the block costs nothing: it is stripped before judging (LEAN_STRIP_COMMENTS),
+        # so it does not move the Lean verdict, the block count or termination, and it
+        # sits before the mask boundary so on a verified row it keeps the full +2.83
+        # advantage. Nothing prices it. As the tail migrates inward, every metric added
+        # for the termination and mask work moves the RIGHT way -- non_termination_rate
+        # and truncated_token_rate both FALL -- so this series is the only contradiction
+        # available. Read it against lean/block_body_chars_mean; the policy already emits
+        # predicted /- <feedback> -/ blocks on 10.5% of rows, so it is not starting from
+        # zero and the level means nothing. The SLOPE is the signal.
+        # READ THE OTHER SERIES, NOT THIS ONE, for the migration above. Measured over
+        # steps 110/116/120 of qwen3-sft-feedback-grpo-lr2e6, this total is 16,079,033
+        # in-fence comment characters of which 15,839,001 -- 98.5% -- are the
+        # /- <feedback> -/ blocks the SFT format requires and the feedback arm trains
+        # deliberately. It is 98.5% normal behaviour, so a full doubling of genuine
+        # rambling moves it by 1.5% and nothing here would show it. Kept as the
+        # denominator and for continuity of the existing series, not as the detector.
+        comment_chars = numeric_values("lean_block_comment_chars")
+        if comment_chars:
+            metrics["lean/block_comment_chars_mean"] = float(np.mean(comment_chars))
+        # The same count with the /- <feedback> -/ annotations subtracted. Its SLOPE is
+        # readable, which the total's is not. This is the series that moves if the tail
+        # migrates inside the fence.
+        #
+        # IT DOES NOT START AT ZERO -- do not read a non-zero level as a dodge appearing.
+        # Measured over 11,503 dumped rollouts from four runs: 3.51% of in-fence comment
+        # characters are non-feedback, 52.5% of rows non-zero, per row mean 159.7 / p50
+        # 28 / p90 339 / p99 1,900. That is ordinary proof narration, which the SFT data
+        # contains too. A live ~160 is the baseline; watch the slope against it.
+        #
+        # The two are not redundant and neither replaces the other. Feedback volume
+        # rising (the objective working) moves the total and leaves this flat; rambling
+        # moving inward moves this and is lost in the total's noise. No comment COUNT is
+        # priced -- charging for comments would tax the required output format. Comment
+        # CONTENT is not equally insulated: a ```lean4 fence inside an in-fence comment
+        # counts as an attempt for lean/attempt_blocks_mean and is priced by the ramp.
+        # That is the fence scanner's behaviour, not this metric's; the gap between
+        # lean/attempts_mean and lean/attempt_blocks_mean is where it shows.
+        other_comment_chars = numeric_values("lean_block_other_comment_chars")
+        if other_comment_chars:
+            metrics["lean/block_other_comment_chars_mean"] = float(
+                np.mean(other_comment_chars)
+            )
+        body_chars = numeric_values("lean_block_body_chars")
+        if body_chars:
+            metrics["lean/block_body_chars_mean"] = float(np.mean(body_chars))
+
         # Reward SHAPING, separated from capability. lean/reward_mean is the PENALIZED
         # score, so on the step this landed it steps down by up to 0.15 with no change in
         # solving ability; without lean/base_reward_mean beside it a shaping-driven level
@@ -888,15 +1379,59 @@ class RayPPOTrainer:
             metrics["lean/penalty_total_mean"] = float(np.mean(penalty_totals))
             metrics["lean/penalized_rate"] = float(np.mean([p > 0 for p in penalty_totals]))
 
+        # lean_terminated carries the STRICT signal: the row's last non-padding token is a
+        # configured stop id AND the decoded text past the last closed block is at most
+        # LEAN_MAX_TRAILING_WS (3) whitespace characters -- BOUNDED, because an unbounded
+        # allowance let a policy pad after its proof for free. The reward manager emits
+        # the flag under both this name and
+        # lean_terminated_strict with the same value; this metric is read off the name
+        # verl has always used so the W&B series does not break at the changeover.
         terminated_flags = reward_extra_infos_dict.get("lean_terminated", None)
+        terminated = None
         if terminated_flags is not None and len(terminated_flags) > 0:
-            terminated_rate = float(np.mean([_truthy(v) for v in terminated_flags]))
+            terminated = [_truthy(v) for v in terminated_flags]
+            terminated_rate = float(np.mean(terminated))
             metrics["lean/terminated_rate"] = terminated_rate
-            # The rate the non-termination penalty is actually charged at. Compare with
-            # lean/ends_with_eval_stop_rate: the two triggers were calibrated on different
-            # populations, so their divergence is worth watching on the first step.
+            # The rate the non-termination penalty is actually charged at.
             metrics["lean/non_termination_rate"] = 1.0 - terminated_rate
 
+            # The exposure the mask's "keep one token past the closing fence" rule takes
+            # on knowingly: these rows verify, so they keep a POSITIVE advantage, and the
+            # token that rule keeps is the first token of a garbage tail rather than an
+            # EOS -- so it is REINFORCED.
+            #
+            # DO NOT compare this against the 0.1% the design notes quote. That figure is
+            # per rollout that RAN TO THE CAP, and it was measured before the strict
+            # trigger widened "not terminated" to include rows that stopped cleanly with a
+            # tail -- which come from the population that verifies 44.6% of the time, not
+            # 0.1%. The comparable direct count is 0.21% (6 of 2852 verified rollouts
+            # carried a tail), and this metric's denominator is the whole batch on top of
+            # that, so multiply by lean/non_termination_rate before comparing with either.
+            # Logged so a move off it is visible rather than inferred; the level at the
+            # changeover is a definition change, the slope after it is the signal.
+            if statuses and len(statuses) == len(terminated):
+                verified_and_open = [
+                    str(status) == "verified" and not flag for status, flag in zip(statuses, terminated, strict=True)
+                ]
+                metrics["lean/verified_not_terminated_rate"] = float(np.mean(verified_and_open))
+
+        # Condition 1 of the strict trigger on its own: the row ended on a stop id,
+        # whatever it wrote before it. The GAP between this and lean/terminated_rate is
+        # the population the strict trigger newly charges -- rollouts that stopped, but
+        # not at their proof -- and it is the number to read on the first step after a
+        # termination-rule change, because a drop in terminated_rate alone cannot say
+        # whether the model stopped stopping or merely stopped stopping CLEANLY.
+        stopped_flags = reward_extra_infos_dict.get("lean_stopped_on_eos", None)
+        if stopped_flags is not None and len(stopped_flags) > 0:
+            stopped = [_truthy(v) for v in stopped_flags]
+            metrics["lean/stopped_on_eos_rate"] = float(np.mean(stopped))
+            if terminated is not None and len(terminated) == len(stopped):
+                stopped_elsewhere = [flag and not done for flag, done in zip(stopped, terminated, strict=True)]
+                metrics["lean/stopped_not_at_block_rate"] = float(np.mean(stopped_elsewhere))
+
+        # The LOOSEST of the three termination signals and a pure drift metric: a policy
+        # can satisfy it by appending three backticks. Kept beside the other two precisely
+        # so the divergence is visible.
         eval_stop_flags = reward_extra_infos_dict.get("ends_with_eval_stop", None)
         if eval_stop_flags is not None and len(eval_stop_flags) > 0:
             metrics["lean/ends_with_eval_stop_rate"] = float(
@@ -1471,9 +2006,44 @@ class RayPPOTrainer:
         self._lean_tail_eos_ids_cache = frozenset(ids)
         return self._lean_tail_eos_ids_cache
 
+    def _lean_tail_max_trailing_ws(self) -> int:
+        """How much whitespace may sit between a closing fence and a force-kept EOS.
+
+        Read from LEAN_MAX_TRAILING_WS, the SAME environment variable the reward manager
+        reads for its termination rule, and not from a second Hydra key: the trainer is
+        deciding whether a row "ended at its proof", and that question already has an
+        owner. A second knob would let the two answers drift, and the drift is silent --
+        the reward would stop calling a padded row terminated while the trainer went on
+        force-keeping its EOS, or the reverse.
+        """
+        cached = getattr(self, "_lean_tail_max_trailing_ws_cache", None)
+        if cached is not None:
+            return cached
+
+        value = _LEAN_MAX_TRAILING_WS_DEFAULT
+        raw = os.environ.get("LEAN_MAX_TRAILING_WS", None)
+        if raw is not None:
+            try:
+                parsed = int(str(raw).strip())
+            except (TypeError, ValueError):
+                parsed = -1
+            if parsed < 0:
+                logger.warning(
+                    "LEAN_MAX_TRAILING_WS=%r is not an integer >= 0; the EOS adjacency rule "
+                    "will use %d.",
+                    raw,
+                    value,
+                )
+            else:
+                value = parsed
+
+        self._lean_tail_max_trailing_ws_cache = value
+        return value
+
     def _lean_tail_response_mask(self, batch: DataProto, metrics: dict[str, Any]) -> torch.Tensor | None:
-        """Keep-mask that ends a response at its last CLOSED lean block; see
-        lean_tail_response_mask for the measured reason this exists.
+        """Keep-mask that ends a response ONE token past its last CLOSED lean block; see
+        lean_tail_response_mask for the measured reason this exists, and for why that one
+        extra token is not an off-by-one.
 
         Returns None whenever the truncation is off or cannot be done SAFELY, and the
         caller then leaves every mask untouched. Failing open is the whole discipline
@@ -1484,10 +2054,16 @@ class RayPPOTrainer:
         # Written unconditionally so a flat line reads as "nothing was truncated" rather
         # than "the metric stopped being emitted".
         metrics["mask/truncated_token_rate"] = 0.0
+        metrics["mask/masked_tokens"] = 0.0
         metrics["mask/truncated_rows"] = 0.0
         metrics["mask/truncated_row_rate"] = 0.0
         metrics["mask/no_closed_block_rows"] = 0.0
         metrics["mask/map_fallback_rows"] = 0.0
+        # Rows whose terminal EOS was NOT force-kept because it sat behind a tail. This
+        # is the population the adjacency rule newly takes gradient away from, so it is
+        # the series that says how often the old unconditional carve-out was handing a
+        # derailed row a negative gradient on its own stop token.
+        metrics["mask/eos_masked_rows"] = 0.0
         # 1.0 only when the cut actually ran this step. A disabled run is otherwise
         # indistinguishable in W&B from a run in which nothing needed truncating.
         metrics["mask/enabled"] = 0.0
@@ -1581,6 +2157,22 @@ class RayPPOTrainer:
                     strategy,
                 )
 
+        ws_table = getattr(self, "_lean_tail_ws_table", _UNSET)
+        if ws_table is _UNSET:
+            ws_table = build_token_trailing_ws_bytes(self.tokenizer, table)
+            self._lean_tail_ws_table = ws_table
+            if ws_table is None:
+                # Not fatal, and deliberately not a reason to disable the cut: without it
+                # the terminal EOS is simply force-kept wherever it lands, which is the
+                # behaviour that shipped before the adjacency rule. Say it once, because
+                # otherwise mask/eos_masked_rows reading a flat 0.0 looks like "no row
+                # ever rambled past its proof".
+                logger.warning(
+                    "no trailing-whitespace table could be built for %s; the terminal EOS "
+                    "will be force-kept wherever it lands, as before the adjacency rule.",
+                    type(self.tokenizer).__name__,
+                )
+
         tail_mask, stats = lean_tail_response_mask(
             responses,
             response_mask,
@@ -1588,17 +2180,24 @@ class RayPPOTrainer:
             table,
             eos_ids=self._lean_tail_eos_ids(),
             response_chars=batch.non_tensor_batch.get("response_chars", None),
+            token_trailing_ws=ws_table,
+            max_trailing_ws=self._lean_tail_max_trailing_ws(),
         )
 
         rows = max(stats["rows"], 1.0)
         response_tokens = max(stats["response_tokens"], 1.0)
         metrics["mask/truncated_token_rate"] = stats["masked_tokens"] / response_tokens
+        # The same quantity unnormalised. The rate alone cannot separate "a few rows
+        # rambled for 10k tokens" from "every row carried a short tail", and the two want
+        # different responses.
+        metrics["mask/masked_tokens"] = stats["masked_tokens"]
         metrics["mask/truncated_rows"] = stats["truncated_rows"]
         metrics["mask/truncated_row_rate"] = stats["truncated_rows"] / rows
         metrics["mask/no_closed_block_rows"] = stats["no_block_rows"]
         # This one should sit at 0. Anything else means the two processes disagree about
         # what a row says, and the truncation is quietly doing nothing on those rows.
         metrics["mask/map_fallback_rows"] = stats["fallback_rows"]
+        metrics["mask/eos_masked_rows"] = stats["eos_masked_rows"]
         metrics["mask/enabled"] = 1.0
         return tail_mask
 
@@ -1677,6 +2276,15 @@ class RayPPOTrainer:
         return token_ids, weights, truncated
 
     def _maybe_append_feedback_aux_batch(self, batch: DataProto, metrics: dict[str, Any]) -> DataProto:
+        # ORDERING DEPENDENCY -- this MUST keep running after compute_advantage.
+        # The aux rows are built by index_select from real rows, so each one inherits its
+        # source row's uid, lean_status and lean_excess_blocks_penalty while carrying
+        # rm_scores == 0 and a zero ppo_response_mask: by content, nothing distinguishes an
+        # aux row from a real rollout. Called before the advantage instead, a duplicated
+        # "verified" would suppress the all-fail refund for a genuine group, and a
+        # duplicated penalty would be refunded onto a zero score. This returns a NEW
+        # DataProto rather than mutating `batch`, which is the other half of the guarantee.
+        # See compute_grpo_outcome_advantage, which asserts one group id per scored row.
         feedback_cfg = self.config.actor_rollout_ref.actor.get("feedback_loss", {})
         if not _truthy(feedback_cfg.get("enabled", False)):
             return batch
@@ -3079,6 +3687,7 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+                        metrics.update(batch.meta_info.pop("lean_attempt_neutralize_stats", {}))
 
                     # update critic
                     if self.use_critic:

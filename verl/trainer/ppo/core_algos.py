@@ -296,6 +296,9 @@ def compute_grpo_outcome_advantage(
     norm_adv_by_std_in_grpo: bool = True,
     valid_reward_mask: Optional[torch.Tensor] = None,
     config: Optional[AlgoConfig] = None,
+    attempt_penalty: Optional[torch.Tensor] = None,
+    verified: Optional[torch.Tensor] = None,
+    neutralize_stats: Optional[dict] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Compute advantage for GRPO, operating only on Outcome reward
@@ -314,6 +317,26 @@ def compute_grpo_outcome_advantage(
             whether to scale the GRPO advantage
         config: `(Optional[AlgoConfig])`
             algorithm configuration object
+        attempt_penalty: `(Optional[torch.Tensor])`
+            shape is (bs,). The per-row APPLIED excess-attempt penalty
+            (lean_excess_blocks_penalty), not the coefficient and not the row's total
+            shaping. Supplied together with `verified` it enables the all-fail-group
+            refund described below; None on either disables it.
+        verified: `(Optional[torch.Tensor])`
+            shape is (bs,), bool. The UNSHAPED verdict (lean_status == "verified"),
+            never a threshold on the score.
+        neutralize_stats: `(Optional[dict])`
+            out-parameter. Filled with the refund metrics when the feature runs. An
+            out-parameter rather than a wider return because the (advantages, returns)
+            arity is part of the register_adv_est contract.
+
+    Note:
+        The refund reaches training only through ray_trainer.compute_advantage, which is
+        the only caller that supplies these three arguments. The transfer_queue trainer
+        (verl/experimental/transfer_queue/ray_trainer.py) and the GRPO_VECTORIZED
+        estimator call GRPO without them and therefore do NOT neutralise; the flag is
+        inert there by design, and compute_advantage warns once if it is on under an
+        estimator that cannot honour it.
 
     Note:
         If norm_adv_by_std_in_grpo is True, the advantage is scaled by the std, as in the original GRPO.
@@ -339,6 +362,105 @@ def compute_grpo_outcome_advantage(
 
     with torch.no_grad():
         bsz = scores.shape[0]
+
+        # (D) NEUTRALISE THE EXCESS-ATTEMPT PENALTY IN ALL-FAIL GROUPS.
+        #
+        # 44.1% of groups (steps 100-125, 6656 rollouts, G=8) contain no verified
+        # rollout. In such a group the attempt penalty is the ONLY thing separating one
+        # rollout from another, so after normalisation corr(attempts, advantage) = -0.552
+        # and a one-attempt failure earns +0.049 advantage. A term meant to discourage
+        # flailing instead teaches "give up" on exactly the problems not yet solved.
+        # Refunding it where no success exists to compare against leaves it acting only
+        # in the groups it was written for.
+        #
+        # THE REFUND MUST LAND ON THE PRE-NORMALISATION SCALAR, which is why it sits
+        # above the id2score loop rather than being applied to the advantages. Both the
+        # group mean and the group std are functions of the whole reward vector, so
+        # changing one row changes the denominator of every row in its group:
+        # (s_i + p_i - mean') / std' is NOT (s_i - mean) / std + p_i / std, and no
+        # post-hoc correction of a normalised advantage can reproduce it. Placed here,
+        # everything below -- the mean/std, the grpo_adv_std_floor clamp, the
+        # normalisation and the broadcast -- operates on reconstructed scalars by
+        # construction, with no further edits. In particular the floor still clamps a std
+        # computed FROM the reconstructed scores, which is where it has to act: an
+        # all-fail group's reconstructed spread is usually SMALLER, so the floor binds
+        # more often, not less.
+        #
+        # The group verdict is decided HERE, in the same loop body that defines group
+        # membership, and not by the caller. It has to reuse both the `index` array
+        # id2score groups by and the `valid_reward_mask[i]` guard id2score applies:
+        # RewardLoopManager zeroes a non-finite score and flips lean_valid_reward to
+        # False WITHOUT touching lean_status, so a row can read "verified" while this
+        # function has already dropped it from the group. Ungated, that row would make an
+        # effectively all-fail group count as solved and suppress its refund.
+        #
+        # ORDERING DEPENDENCY, asserted below: every row here must be a real rollout.
+        # Feedback AUX rows are built by index_select from real rows, so they inherit the
+        # source row's uid, lean_status AND lean_excess_blocks_penalty while carrying
+        # rm_scores == 0. They are appended after this function runs
+        # (_maybe_append_feedback_aux_batch); hoisting that above the advantage would let
+        # a duplicated "verified" suppress a genuine group's refund and add a duplicated
+        # penalty onto a zero score.
+        if attempt_penalty is not None and verified is not None:
+            assert len(index) == bsz, (
+                "attempt-penalty neutralisation needs exactly one group id per scored row, "
+                f"got {len(index)} ids for {bsz} rows"
+            )
+            attempt_penalty = attempt_penalty.to(device=scores.device, dtype=scores.dtype).reshape(-1)
+            verified = verified.to(device=scores.device, dtype=torch.bool).reshape(-1)
+            assert attempt_penalty.shape[0] == bsz and verified.shape[0] == bsz
+
+            groups_with_valid_rows = set()
+            groups_with_verified = set()
+            for i in range(bsz):
+                if valid_reward_mask[i]:
+                    groups_with_valid_rows.add(index[i])
+                    if verified[i]:
+                        groups_with_verified.add(index[i])
+            # A group exists iff it has at least one valid row -- the same rule id2score
+            # uses. A group of nothing but invalid rows has no opinion about whether it
+            # was solved and must not deflate the neutralised-group rate.
+            neutralized_groups = groups_with_valid_rows - groups_with_verified
+
+            addback = torch.zeros_like(scores)
+            valid_rows = 0
+            neutralized_rows = 0
+            for i in range(bsz):
+                if not valid_reward_mask[i]:
+                    # Invalid rows are excluded from id2score and re-zeroed at the
+                    # broadcast, so a refund here could not move the gradient -- but it
+                    # WOULD inflate the added-back metric with rows that got nothing.
+                    continue
+                valid_rows += 1
+                if index[i] in neutralized_groups:
+                    neutralized_rows += 1
+                    addback[i] = attempt_penalty[i]
+
+            if bool(torch.any(addback != 0.0)):
+                # Skipped entirely when nothing is owed, so a batch in which every group
+                # solved something takes the identical float path it took before.
+                scores = scores + addback
+
+            if neutralize_stats is not None:
+                added_back = float(addback.sum().item())
+                neutralize_stats["lean/attempt_penalty_neutralize_unavailable"] = 0.0
+                neutralize_stats["lean/attempt_penalty_neutralized_group_rate"] = (
+                    len(neutralized_groups) / len(groups_with_valid_rows) if groups_with_valid_rows else 0.0
+                )
+                neutralize_stats["lean/attempt_penalty_neutralized_row_rate"] = (
+                    neutralized_rows / valid_rows if valid_rows else 0.0
+                )
+                # The two means differ only in denominator, and both are reported because
+                # either alone misleads: the first is directly comparable to the existing
+                # per-batch excess-penalty mean, the second says what a row inside a
+                # neutralised group actually got back and reads ~2.3x larger.
+                neutralize_stats["lean/attempt_penalty_added_back_mean"] = (
+                    added_back / valid_rows if valid_rows else 0.0
+                )
+                neutralize_stats["lean/attempt_penalty_added_back_mean_neutralized"] = (
+                    added_back / neutralized_rows if neutralized_rows else 0.0
+                )
+
         for i in range(bsz):
             if valid_reward_mask[i]:
                 id2score[index[i]].append(scores[i])

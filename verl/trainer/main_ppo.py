@@ -309,6 +309,19 @@ class TaskRunner:
         # Used for multimodal LLM, could be None
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 
+        # model.custom_chat_template was previously applied ONLY on the worker side
+        # (verl/workers/fsdp_workers.py:321), leaving THIS driver-side tokenizer on the
+        # checkpoint's own template. That matters because the driver tokenizer is what
+        # RayPPOTrainer._tokenize_reprompt uses to build the SDPO teacher reprompt, so the
+        # teacher was conditioned on a prompt wrapped in the checkpoint's role markers while
+        # the policy is trained and sampled on the custom (e.g. raw pass-through) format --
+        # a distribution mismatch on every distillation gradient, with no error raised.
+        custom_chat_template = config.actor_rollout_ref.model.get("custom_chat_template", None)
+        if custom_chat_template is not None:
+            tokenizer.chat_template = custom_chat_template
+            if processor is not None:
+                processor.chat_template = custom_chat_template
+
         resource_pool_manager = self.init_resource_pool_mgr(config)
 
         from verl.utils.dataset.rl_dataset import collate_fn

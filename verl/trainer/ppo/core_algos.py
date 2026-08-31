@@ -1111,20 +1111,33 @@ def agg_loss(
     """
     if loss_agg_mode == "token-mean":
         if batch_num_tokens is None:
-            batch_num_tokens = loss_mask.sum()
+            # Same 0/0 -> NaN hazard as the seq-mean branches below. Callers that pass
+            # batch_num_tokens explicitly already clamp it (see compute_self_distillation_loss);
+            # the KL term calls agg_loss WITHOUT it, so a fully-masked micro-batch -- an aux row
+            # or an SDPO non-target row at ppo_micro_batch_size_per_gpu=1 -- would NaN the KL.
+            batch_num_tokens = torch.clamp(loss_mask.sum(), min=1.0)
         loss = verl_F.masked_sum(loss_mat, loss_mask) / batch_num_tokens * dp_size
     elif loss_agg_mode == "seq-mean-token-sum":
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)  # token-sum
         seq_mask = (torch.sum(loss_mask, dim=-1) > 0).float()  # exclude fully masked sequences
         if global_batch_size is None:
-            global_batch_size = seq_mask.sum()
+            # Clamp: a micro-batch in which EVERY sequence is fully masked gives
+            # seq_mask.sum() == 0 and the division below becomes 0/0 = NaN. That is not
+            # hypothetical -- with ppo_micro_batch_size_per_gpu=1 a single fully-masked row is
+            # a whole micro-batch, and both the feedback auxiliary rows (ppo_response_mask
+            # zeroed) and SDPO's non-target rows (self_distillation_mask zeroed) produce them;
+            # a measured SDPO step had 54% such micro-batches and every loss came out NaN.
+            # token-mean above is already protected because its caller passes a clamped
+            # batch_num_tokens; these branches compute their own denominator and must clamp it
+            # themselves. masked_sum is 0 in that case, so 0/1 = 0 is the correct loss.
+            global_batch_size = torch.clamp(seq_mask.sum(), min=1.0)
         loss = verl_F.masked_sum(seq_losses, seq_mask) / global_batch_size * dp_size  # seq-mean
     elif loss_agg_mode == "seq-mean-token-mean":
         seq_mask = torch.sum(loss_mask, dim=-1)  # per-sequence token count
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / (seq_mask + 1e-8)  # token-mean
         seq_mask = (seq_mask > 0).float()  # exclude fully masked sequences
         if global_batch_size is None:
-            global_batch_size = seq_mask.sum()
+            global_batch_size = torch.clamp(seq_mask.sum(), min=1.0)  # see note above: 0/0 -> NaN
         loss = verl_F.masked_sum(seq_losses, seq_mask) / global_batch_size * dp_size  # seq-mean
     elif loss_agg_mode == "seq-mean-token-sum-norm":
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)

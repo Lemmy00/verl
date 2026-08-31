@@ -169,7 +169,15 @@ self_distillation:
   environment_feedback_format: sft_proof_repair
 
   # SFT proof-repair prompt template with the annotated failed attempt in a Lean block.
-  proof_repair_template: "{prompt}\n\nPrevious failed attempt:\n\n```lean4\n{failed_attempt}\n```\n\nUse it to improve your solution.\n"
+  # MUST mirror the SFT proof-repair prompt exactly, or the teacher is conditioned on a
+  # format the policy has never seen. Source of truth:
+  # notebooks/data-preparation/process_data_feedback2.ipynb ->
+  #   proof_repair_question_feedback_format = question_feedback_format(q) + "\n"
+  #                                           + answer_template_feedback_no_extraction(attempt)
+  # The failed attempt is introduced with the COMPLETE-proof marker (that is how SFT framed
+  # it); the model then answers with the CORRECTED-proof marker. verl rstrips {prompt}, so the
+  # blank line before the marker has to come from this template.
+  proof_repair_template: "{prompt}\n\nHere is the complete Lean 4 proof annotated with Lean 4 compiler feedback blocks:\n\n```lean4\n{failed_attempt}\n```\n"
 
   # Whether to fall back to status/plain attempted-code feedback when canonical annotations are missing
   use_fallback_environment_feedback: false

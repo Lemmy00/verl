@@ -96,11 +96,12 @@ class SelfDistillationConfig(BaseConfig):
         "{feedback_raw}\n\n"
     )
     environment_feedback_format: str = "sft_proof_repair"
+    # Mirrors the SFT proof-repair prompt; see the comment in
+    # verl/trainer/config/actor/actor.yaml. Keep the two in sync.
     proof_repair_template: str = (
         "{prompt}\n\n"
-        "Previous failed attempt:\n\n"
-        "```lean4\n{failed_attempt}\n```\n\n"
-        "Use it to improve your solution.\n"
+        "Here is the complete Lean 4 proof annotated with Lean 4 compiler feedback blocks:\n\n"
+        "```lean4\n{failed_attempt}\n```\n"
     )
     use_fallback_environment_feedback: bool = False
     include_environment_feedback: bool = True

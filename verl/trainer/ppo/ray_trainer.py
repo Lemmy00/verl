@@ -155,10 +155,11 @@ def _lean_valid_reward_mask(reward_extra_infos_dict: dict, length: int, device: 
 
 
 # The one status string that means "this rollout proved the requested theorem". It has a
-# single producer in the reward. Deliberately NOT derived from the score: score > 0 is
-# also true of renamed_declaration (0.7, the right statement under the wrong name), and
-# score == 1.0 is false for every verified rollout that paid any shaping penalty -- the
-# worst verified row scores 0.55.
+# single producer in the reward. Deliberately NOT derived from the score: score == 1.0 is
+# false for every verified rollout that paid any shaping penalty (the worst verified row
+# scores 0.55), and score > 0 is a threshold over a ladder whose rungs move -- it is also
+# true of renamed_declaration whenever RENAMED_DECLARATION_REWARD is nonzero (it has been
+# 0.7; it is 0.0 today), and the shaping penalties push honest failures below zero.
 _LEAN_VERIFIED_STATUS = "verified"
 
 
@@ -1446,6 +1447,22 @@ class RayPPOTrainer:
         if excess_charges:
             metrics["lean/excess_block_penalty_mean"] = float(np.mean(excess_charges))
             metrics["lean/excess_block_rate"] = float(np.mean([c > 0 for c in excess_charges]))
+
+        # The give-up charge: failed, exactly one closed block, no trailing unclosed
+        # opener. Its own rate series rather than only its contribution to
+        # lean/penalty_total_mean, because after the all-fail neutralisation below
+        # (neutralize_attempt_penalty_in_all_fail_groups) the excess ramp is REFUNDED
+        # inside all-fail groups -- 44.1% of groups at the time of measurement -- which
+        # leaves this charge as the only per-row shaping term still separating rows
+        # there. It is the single term the (D)+(G) pair is betting on, so it is the last
+        # one that should be invisible. Folded into penalty_total it is
+        # indistinguishable from non-termination: at the measured 16.4% incidence it is
+        # 0.164 * 0.05 = 0.0082 of mean reward, well under the non-termination term's
+        # contribution, so nothing separates "firing as designed" from "never fires".
+        give_up_charges = numeric_values("lean_give_up_penalty")
+        if give_up_charges:
+            metrics["lean/give_up_penalty_mean"] = float(np.mean(give_up_charges))
+            metrics["lean/give_up_rate"] = float(np.mean([c > 0 for c in give_up_charges]))
 
         error_kinds = [
             str(value)

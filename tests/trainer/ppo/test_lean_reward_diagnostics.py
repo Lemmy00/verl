@@ -35,26 +35,45 @@ def test_lean_reward_diagnostics_aggregates_timeout_causes_and_latency():
 
     metrics = trainer._lean_reward_diagnostics(rewards, extra)
 
-    assert metrics["lean/valid_proof_rate"] == pytest.approx(1 / 3)
+    assert metrics["lean/status_rate/verified"] == pytest.approx(1 / 3)
     assert metrics["lean/infra_failure_rate"] == pytest.approx(1 / 3)
     assert metrics["lean/error_kind/wall_timeout"] == 1
     assert metrics["lean/error_kind_rate/compiler_error"] == pytest.approx(1 / 3)
     assert metrics["lean/valid_reward_rate"] == pytest.approx(2 / 3)
-    assert metrics["lean/timeout_events"] == 1.0
-    assert metrics["lean/timeout_rollout_rate"] == pytest.approx(1 / 3)
-    assert metrics["lean/candidate_timeout_events"] == 1.0
-    assert metrics["lean/retry_events"] == 1.0
-    assert metrics["lean/command_attempt_events"] == 4.0
+    assert metrics["lean/timeout_rate"] == pytest.approx(1 / 3)
+    # A candidate timeout IS the lean_timeout status; the duplicate family is gone.
+    assert metrics["lean/status_rate/lean_timeout"] == pytest.approx(0.0)
+    assert metrics["lean/retry_rate"] == pytest.approx(1 / 3)
+    assert metrics["lean/command_attempt_rate"] == pytest.approx(1.0)
+    assert metrics["lean/command_attempt_per_rollout"] == pytest.approx(4 / 3)
     assert metrics["lean/context_wait_s/mean"] == 2.0
     assert metrics["lean/verify_wall_s/p90"] == pytest.approx(49.6)
     assert metrics["lean/total_wall_s/max"] == 62.0
     assert metrics["lean/problem_cache_hit_rate"] == pytest.approx(2 / 3)
     assert metrics["lean/context_cache_or_env_hit_rate"] == pytest.approx(2 / 3)
     assert metrics["lean/executor_workers"] == 64.0
+    # The warmup gauges moved: this batch has a non-zero infra roll-up, so they are all
+    # emitted individually as well.
+    assert metrics["lean/infra_events_total"] == pytest.approx(66.0)
     assert metrics["lean/warmup_attempts_total"] == 65.0
     assert metrics["lean/restart_warmups_total"] == 1.0
-    assert metrics["lean/loss_reward_mean"] == pytest.approx(1 / 3)
     assert metrics["lean/reward_mean"] == pytest.approx(1 / 3)
+    for dropped in (
+        "lean/valid_proof_rate",
+        "lean/loss_reward_mean",
+        "lean/error_kind_rate/wall_timeout",
+        "lean/candidate_timeout_events",
+        "lean/candidate_timeout_per_rollout",
+        "lean/candidate_timeout_rollout_rate",
+        "lean/timeout_events",
+        "lean/timeout_rollout_rate",
+        "lean/timeout_per_rollout",
+        "lean/retry_events",
+        "lean/retry_rollout_rate",
+        "lean/command_attempt_events",
+        "lean/command_attempt_rollout_rate",
+    ):
+        assert dropped not in metrics
 
 
 def test_lean_reward_diagnostics_separates_attempts_from_closed_blocks():

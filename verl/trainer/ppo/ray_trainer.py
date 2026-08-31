@@ -162,6 +162,140 @@ def _lean_valid_reward_mask(reward_extra_infos_dict: dict, length: int, device: 
 # 0.7; it is 0.0 today), and the shaping penalties push honest failures below zero.
 _LEAN_VERIFIED_STATUS = "verified"
 
+# ---------------------------------------------------------------------------------
+# Metric-surface constants for _lean_reward_diagnostics.
+#
+# The last full run emitted 268 distinct step keys, of which 28 were zero on every one
+# of its 226 steps and 28 groups were byte-identical series. The constants below are the
+# de-duplication, and every one of them was re-derived from that run's worker log before
+# anything was deleted -- not taken on trust.
+# ---------------------------------------------------------------------------------
+
+# Statuses whose rate is pinned to 0.0 rather than left absent. See the comment at the
+# use site: each of these is the surviving name of a series that was dropped as a
+# duplicate, so it has to be a continuous series and not a sparse one.
+_LEAN_ALWAYS_REPORTED_STATUSES = ("verified", "lean_timeout")
+
+# (reward_extra_info key, metric stem) for the per-rollout event counters.
+#
+# Each of these used to emit THREE keys -- _events, _per_rollout and _rollout_rate.
+# _events is _per_rollout times the (constant, and separately logged) rollout count, and
+# _per_rollout equals _rollout_rate exactly whenever no single rollout fires the counter
+# more than once. So one key, lean/<stem>_rate, carries all of it in the common case.
+#
+# "candidate_timeout" is NOT in this table: lean/candidate_timeout_per_rollout and
+# lean/candidate_timeout_rollout_rate were byte-identical to lean/status_rate/lean_timeout
+# on all 226 steps, and lean/candidate_timeout_events was byte-identical to
+# lean/status/lean_timeout -- a candidate timeout IS the lean_timeout status. Read those.
+_LEAN_EVENT_COUNTERS = (
+    ("lean_timeouts", "timeout"),
+    ("lean_feedback_fallback_timeouts", "feedback_fallback_timeout"),
+    ("lean_setup_timeouts", "setup_timeout"),
+    ("lean_replay_timeouts", "replay_timeout"),
+    ("lean_replay_failures", "replay_failure"),
+    ("lean_retries", "retry"),
+    ("lean_command_attempts", "command_attempt"),
+)
+
+# Counters where a single rollout demonstrably fires more than once, so the fraction of
+# AFFECTED rollouts is strictly less information than the mean count and both are kept.
+# Measured on the same 226 steps:
+#   retry            -- step 64 logged 2 retry events across 1 affected rollout.
+#   command_attempt  -- mean 1.10-1.26 attempts per rollout, i.e. the two series differ on
+#                       226 of 226 steps.
+# The other five never exceeded one event per rollout; they get _per_rollout only on a
+# step where they actually do (see the emit site), so the information is never lost, it
+# just does not cost a permanent series.
+_LEAN_MULTI_EVENT_COUNTERS = frozenset({"retry", "command_attempt"})
+
+# Infrastructure counters, as (metric key suffix, reward_extra_info key, reducer name).
+# Zero on all 226 steps of the last run and not a property of the policy: they are the
+# Lean executor's health, not the model's. Rolled into lean/infra_events_total, which is
+# always emitted; the individual keys come back in full the moment that total moves.
+_LEAN_INFRA_EVENT_SUMS = (
+    ("replay_failure_events", "lean_replay_failures"),
+    ("replay_timeout_events", "lean_replay_timeouts"),
+    ("setup_timeout_events", "lean_setup_timeouts"),
+)
+_LEAN_INFRA_GAUGES = (
+    ("warmup_attempts_total", "lean_warmup_attempts_total"),
+    ("warmup_failures_total", "lean_warmup_failures_total"),
+    ("restart_warmups_total", "lean_restart_warmups_total"),
+    ("restart_warmup_failures_total", "lean_restart_warmup_failures_total"),
+)
+# The event counters above are also reported per-rollout by _LEAN_EVENT_COUNTERS; those
+# rate keys are suppressed on a healthy step for the same reason.
+_LEAN_INFRA_RATE_STEMS = ("replay_failure", "replay_timeout", "setup_timeout")
+
+# The feedback-quality family, aggregated over the rows that were actually scored.
+# Computed on EVERY training rollout and, until now, aggregated only into val-aux/ --
+# visible once every 50 steps, on the validation set, and nowhere on the training
+# distribution the policy is actually moving on.
+_LEAN_FEEDBACK_QUALITY_METRICS = (
+    "block_f1",
+    "block_precision",
+    "block_recall",
+    "anchored_block_f1",
+    "token_f1",
+    "sequence_similarity",
+    "gold_blocks",
+    "predicted_blocks",
+    "block_count_abs_error",
+    "error_presence_correct",
+)
+
+
+def _lean_feedback_quality_metrics(reward_extra_infos_dict: dict) -> dict[str, float]:
+    """Predicted-feedback quality on the TRAINING distribution, per step.
+
+    These eleven scores are computed on every training rollout -- the per-row
+    feedback_quality_* keys have been in reward_extra_info all along -- and were
+    aggregated nowhere except val-aux/, i.e. once every 50 steps, on the validation
+    set. The feedback objective is trained on every step; it was measurable on 2% of
+    them, against a different distribution.
+
+    Averaged over the SCORED rows only. Unscored rows carry 0.0 for every score (the
+    key set has to be identical on every row or verl's per-key array build raises), so
+    a plain batch mean is the true score multiplied by the scoring rate -- it moves
+    when feedback quality moves and it moves just as far when the fraction of rows
+    with a gold side to compare against moves, and nothing tells the two apart. That
+    is what lean/feedback_quality/scored_rate is for, and it is the denominator every
+    other key here is divided by.
+    """
+    metrics: dict[str, float] = {}
+    scored_flags = reward_extra_infos_dict.get("feedback_quality_scored", None)
+    if scored_flags is None or len(scored_flags) == 0:
+        return metrics
+
+    scored = [_truthy(flag) for flag in scored_flags]
+    # Always emitted, including at 0.0: it is a statement about the DENOMINATOR, not
+    # about feedback quality, so zero is the literal truth and never a misleading
+    # score. It is also the only thing that explains why the keys below are absent.
+    metrics["lean/feedback_quality/scored_rate"] = float(np.mean(scored))
+
+    scored_rows = [index for index, flag in enumerate(scored) if flag]
+    if not scored_rows:
+        # No row had a gold side this step. Every score below would be an average over
+        # an empty set, and emitting 0.0 would read as "the model predicted feedback
+        # and got it entirely wrong" rather than "nothing was compared".
+        return metrics
+
+    for name in _LEAN_FEEDBACK_QUALITY_METRICS:
+        values = reward_extra_infos_dict.get(f"feedback_quality_{name}", None)
+        if values is None or len(values) != len(scored):
+            continue
+        selected = []
+        for index in scored_rows:
+            try:
+                number = float(values[index])
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(number):
+                selected.append(number)
+        if selected:
+            metrics[f"lean/feedback_quality/{name}"] = float(np.mean(selected))
+    return metrics
+
 
 def _lean_attempt_penalty_inputs(
     data: DataProto, length: int, device: torch.device
@@ -1275,10 +1409,22 @@ class RayPPOTrainer:
         statuses = list(reward_extra_infos_dict.get("lean_status", []))
         if statuses:
             total = max(len(statuses), 1)
-            for status, count in defaultdict(int, {s: statuses.count(s) for s in set(statuses)}).items():
+            counts = {s: statuses.count(s) for s in set(statuses)}
+            # The status families are sparse on purpose -- a status nothing produced this
+            # step gets no key, so a panel appearing IS the event. Two of them are the
+            # exception: they are now the ONLY carrier of a series that used to have a
+            # second, always-present name (lean/valid_proof_rate and
+            # lean/candidate_timeout_*, both dropped as exact duplicates), and a run that
+            # verifies nothing or times out on nothing is precisely the step you must not
+            # lose the point on. Pinned to 0.0 so those two series never gap.
+            for status in _LEAN_ALWAYS_REPORTED_STATUSES:
+                counts.setdefault(status, 0)
+            for status, count in defaultdict(int, counts).items():
                 metrics[f"lean/status/{status}"] = count
                 metrics[f"lean/status_rate/{status}"] = count / total
-            metrics["lean/valid_proof_rate"] = statuses.count("verified") / total
+            # lean/valid_proof_rate was byte-identical to lean/status_rate/verified on all
+            # 226 steps of the last run, by construction (same numerator, same
+            # denominator). Dropped; read lean/status_rate/verified.
             metrics["lean/infra_failure_rate"] = sum("infra" in str(status) for status in statuses) / total
 
         # Self-repair rate: the fraction of rollouts that completed a SECOND attempt.
@@ -1474,7 +1620,14 @@ class RayPPOTrainer:
             for kind in set(error_kinds):
                 count = error_kinds.count(kind)
                 metrics[f"lean/error_kind/{kind}"] = count
-                metrics[f"lean/error_kind_rate/{kind}"] = count / total
+                # lean/error_kind_rate/wall_timeout was byte-identical to
+                # lean/timeout_rollout_rate on all 226 steps of the last run -- same
+                # population, counted twice -- so the RATE is dropped for that one kind
+                # and lean/timeout_rate carries it. The COUNT stays, because the rest of
+                # this family's counts stay and a hole in lean/error_kind/* would read as
+                # "wall timeouts stopped happening".
+                if kind != "wall_timeout":
+                    metrics[f"lean/error_kind_rate/{kind}"] = count / total
 
         valid_flags = reward_extra_infos_dict.get("lean_valid_reward", None)
         if valid_flags is not None and len(valid_flags) > 0:
@@ -1484,23 +1637,33 @@ class RayPPOTrainer:
         if canonical_flags is not None and len(canonical_flags) > 0:
             metrics["feedback/canonical_success_rate"] = float(np.mean([_truthy(v) for v in canonical_flags]))
 
-        for key, metric_name in (
-            ("lean_timeouts", "timeout"),
-            ("lean_candidate_timeouts", "candidate_timeout"),
-            ("lean_feedback_fallback_timeouts", "feedback_fallback_timeout"),
-            ("lean_setup_timeouts", "setup_timeout"),
-            ("lean_replay_timeouts", "replay_timeout"),
-            ("lean_replay_failures", "replay_failure"),
-            ("lean_retries", "retry"),
-            ("lean_command_attempts", "command_attempt"),
-        ):
+        # ONE key per counter: lean/<stem>_rate, the fraction of rollouts that fired it.
+        # _events and _per_rollout are recoverable from it whenever no rollout fires the
+        # counter twice, which is the case for five of the seven; the two where it is not
+        # keep _per_rollout beside the rate, and any other counter that starts
+        # multi-firing gets it back on the step it does. Nothing is lost: a healthy step
+        # logs 6 of these (three of the eight stems are infrastructure and gated below,
+        # and candidate_timeout is gone entirely) where it used to log 24.
+        infra_rate_keys: dict[str, float] = {}
+        for key, metric_name in _LEAN_EVENT_COUNTERS:
             values = numeric_values(key)
-            if values:
-                metrics[f"lean/{metric_name}_events"] = float(sum(values))
+            if not values:
+                continue
+            rate = float(np.mean([value > 0 for value in values]))
+            multi_fired = any(value > 1 for value in values)
+            if metric_name in _LEAN_INFRA_RATE_STEMS:
+                # Held back and emitted below only if the infra roll-up is non-zero.
+                infra_rate_keys[f"lean/{metric_name}_rate"] = rate
+                if metric_name in _LEAN_MULTI_EVENT_COUNTERS or multi_fired:
+                    infra_rate_keys[f"lean/{metric_name}_per_rollout"] = float(np.mean(values))
+                continue
+            metrics[f"lean/{metric_name}_rate"] = rate
+            if metric_name in _LEAN_MULTI_EVENT_COUNTERS or multi_fired:
+                # The rate counts AFFECTED ROLLOUTS, so on a step where one rollout fired
+                # twice it is strictly less than the mean count and the two series stop
+                # meaning the same thing. That is the only condition under which the
+                # second key earns its place.
                 metrics[f"lean/{metric_name}_per_rollout"] = float(np.mean(values))
-                metrics[f"lean/{metric_name}_rollout_rate"] = float(
-                    np.mean([value > 0 for value in values])
-                )
 
         for key, metric_name in (
             ("lean_context_s", "context_wait_s"),
@@ -1529,26 +1692,52 @@ class RayPPOTrainer:
         if executor_workers:
             metrics["lean/executor_workers"] = float(max(executor_workers))
 
-        for key, metric_name in (
-            ("lean_warmup_attempts_total", "warmup_attempts_total"),
-            ("lean_warmup_failures_total", "warmup_failures_total"),
-            ("lean_restart_warmups_total", "restart_warmups_total"),
-            (
-                "lean_restart_warmup_failures_total",
-                "restart_warmup_failures_total",
-            ),
-        ):
+        # ---- infrastructure roll-up -------------------------------------------------
+        #
+        # Replay failures, replay timeouts, setup timeouts and the four warmup gauges are
+        # the Lean executor's health, not the policy's behaviour, and they were 0.0 on all
+        # 226 steps of the last run. Thirteen permanently flat panels train the reader to
+        # stop looking, which is the worst possible state for a metric whose entire job is
+        # to fire once.
+        #
+        # So: ONE always-present gauge. It is a raw event count, not a rate, so it is
+        # never a fraction of a batch that happened to be small, and it is emitted even
+        # when every underlying key is missing (0.0) so the series never gaps. The instant
+        # it moves off zero, every individual key comes back in full on that same step --
+        # nothing is deleted, it is gated.
+        infra_detail: dict[str, float] = dict(infra_rate_keys)
+        infra_total = 0.0
+        for metric_name, key in _LEAN_INFRA_EVENT_SUMS:
             values = numeric_values(key)
             if values:
-                metrics[f"lean/{metric_name}"] = float(max(values))
+                total_events = float(sum(values))
+                infra_detail[f"lean/{metric_name}"] = total_events
+                infra_total += total_events
+        for metric_name, key in _LEAN_INFRA_GAUGES:
+            values = numeric_values(key)
+            if values:
+                # A cumulative process-level gauge echoed on every row: max, not sum.
+                gauge = float(max(values))
+                infra_detail[f"lean/{metric_name}"] = gauge
+                infra_total += gauge
+        metrics["lean/infra_events_total"] = infra_total
+        if infra_total > 0:
+            metrics.update(infra_detail)
 
+        # lean/loss_reward_mean was byte-identical to critic/rewards/mean AND to
+        # critic/score/mean on all 226 steps -- all three are reward_tensor.sum(-1).mean().
+        # The critic pair is upstream verl's and stays; this third name is dropped. The
+        # VALUE is still computed here because lean/reward_mean falls back to it when the
+        # reward manager emits no lean_score, and in that configuration it is the only
+        # reward series this fork has.
         loss_reward_mean = reward_tensor.sum(dim=-1).float().mean().detach().item()
-        metrics["lean/loss_reward_mean"] = loss_reward_mean
         lean_scores = reward_extra_infos_dict.get("lean_score", None)
         if lean_scores is not None and len(lean_scores) > 0:
             metrics["lean/reward_mean"] = float(np.mean([float(score) for score in lean_scores]))
         else:
             metrics["lean/reward_mean"] = loss_reward_mean
+
+        metrics.update(_lean_feedback_quality_metrics(reward_extra_infos_dict))
         return metrics
 
     @staticmethod

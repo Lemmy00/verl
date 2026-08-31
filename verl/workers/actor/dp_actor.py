@@ -967,9 +967,14 @@ class DataParallelPPOActor(BasePPOActor):
                             micro_batch_metrics["actor/feedback_aux_loss"] = (
                                 feedback_lambda * feedback_loss
                             ).detach().item()
-                            micro_batch_metrics["actor/feedback_active_tokens"] = (
-                                (feedback_weights > 0).sum().detach().item()
-                            )
+                            # actor/feedback_active_tokens is NOT emitted. Reduced across
+                            # the micro-batches that carry feedback it came out
+                            # byte-identical to feedback/avg_feedback_tokens on all 226
+                            # steps of the last run, and that name is the honest one: this
+                            # one says "active tokens" but reports a per-micro-batch mean.
+                            # actor/feedback_weight_sum stays -- it is the loss
+                            # denominator, and it is NOT the same series (weights are
+                            # real-valued, active_tokens counts the non-zero ones).
                             micro_batch_metrics["actor/feedback_weight_sum"] = feedback_weight_sum.detach().item()
                         error_weights = model_inputs.get("error_feedback_loss_weights", None)
                         if error_weights is not None:

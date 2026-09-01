@@ -3765,8 +3765,28 @@ class RayPPOTrainer:
                                 loss_agg_mode=actor_config.loss_agg_mode,
                                 loss_scale_factor=actor_config.loss_scale_factor,
                             )
+                            # Emitted under BOTH names, deliberately, and they are the same
+                            # number here because this aggregation uses response_mask -- the
+                            # WHOLE generated response, computed before compute_advantage
+                            # narrows anything (ppo_response_mask does not exist yet at this
+                            # point in the loop).
+                            #
+                            # actor/entropy_full_response has to exist unconditionally. The
+                            # entropy collapse that ended qwen3-sft-feedback-grpo-lr2e6 went
+                            # 0.019 -> 3.5 with 75-90% of the excursion living in the tail
+                            # that ppo_response_mask now removes, so a detector confined to
+                            # the kept prefix can miss the next one. dp_actor.py computes
+                            # both masks properly, but only inside `if calculate_entropy`,
+                            # which is OFF by default -- so on a default run that name never
+                            # appeared and the documented tripwire had no series at all.
+                            # When calculate_entropy IS on, dp_actor overrides both keys
+                            # with its own values and the meanings still hold: actor/entropy
+                            # becomes the narrowed view, actor/entropy_full_response stays
+                            # the whole response.
+                            entropy_value = entropy_agg.detach().item()
                             old_log_prob_metrics = {
-                                "actor/entropy": entropy_agg.detach().item(),
+                                "actor/entropy": entropy_value,
+                                "actor/entropy_full_response": entropy_value,
                                 "perf/mfu/actor_infer": old_log_prob_mfu,
                             }
                             metrics.update(old_log_prob_metrics)

@@ -179,7 +179,19 @@ self_distillation:
   # blank line before the marker has to come from this template.
   proof_repair_template: "{prompt}\n\nHere is the complete Lean 4 proof annotated with Lean 4 compiler feedback blocks:\n\n```lean4\n{failed_attempt}\n```\n"
 
-  # Whether to fall back to status/plain attempted-code feedback when canonical annotations are missing
+  # Whether a row with NO canonical Lean annotation still gets a teacher context. When
+  # true, _lean_status_fallback_feedback builds one from lean_status + clean_lean_code:
+  # one short factual sentence saying WHY the attempt failed, in the same
+  # /- <feedback> ... </feedback> -/ form the canonical annotation uses, so both teacher
+  # formats consume it unchanged. Measured at ~11% of rollouts on the feedback arm.
+  #
+  # ONLY USEFUL WITH THE LEAN FEEDBACK AUX ON. clean_lean_code, canonical_annotated_code
+  # and has_canonical_feedback are all written under `if self.feedback_aux_enabled:` in
+  # lean_reward.py. Without it there is no attempted code to attach and no annotation to
+  # prefer, so EVERY non-verified row falls through to the fallback and gets the bare
+  # sentence with no code -- a "teacher context" carrying zero information the student
+  # does not already have, which still flips self_distillation_mask 0 -> 1 for rows in
+  # all-fail groups. Leave this false unless the reward is emitting the aux keys.
   use_fallback_environment_feedback: false
 
   # Whether to include Lean reward feedback in teacher reprompts

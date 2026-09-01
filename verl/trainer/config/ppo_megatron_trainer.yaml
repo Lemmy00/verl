@@ -144,7 +144,7 @@ algorithm:
   # a closing fence" can live: the EOS on a clean rollout, the first garbage token on a
   # derailed one. A row with no closed block is never truncated -- it is priced by the
   # no_lean_code penalty instead.
-  mask_after_last_lean_block: True
+  mask_after_last_lean_block: False
   use_kl_in_reward: False
   kl_penalty: kl # how to estimate kl divergence
   kl_ctrl:

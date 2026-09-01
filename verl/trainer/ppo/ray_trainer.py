@@ -163,6 +163,134 @@ def _lean_valid_reward_mask(reward_extra_infos_dict: dict, length: int, device: 
 _LEAN_VERIFIED_STATUS = "verified"
 
 # ---------------------------------------------------------------------------------
+# TEACHER CONTEXT FOR ROWS WITH NO CANONICAL LEAN ANNOTATION
+# ---------------------------------------------------------------------------------
+# 10.94% of rollouts (728 of 6,656, steps 100-125 of qwen3-sft-feedback-grpo-lr2e6)
+# reach the reward with has_canonical_feedback=False: the ladder in lean_reward._verify
+# returned BEFORE Lean produced per-block messages, or the annotation pass could not
+# splice them. Measured shares of that 728: lean_timeout 492, wrong_declaration 130,
+# no_lean_code 82, wrong_declaration_name 9, missing_declaration 9, contains_sorry 3,
+# wrong_context 3.  With use_fallback_environment_feedback=false those rows get NO
+# teacher context at all -- 309 of them are self_distillation_mask=0, i.e. they
+# contribute nothing but reference KL.
+#
+# The note below is what stands in for the annotated code, and the ONE thing it has to
+# get right is saying WHY. The message it replaces was `f"Lean verifier status:
+# {status}."` for every status alike, which describes a wall-clock timeout and an
+# unclosed `sorry` in the same words -- and then appended the attempt inside its own
+# ```lean4 fence, which under proof_repair_template lands INSIDE the template's fence
+# and breaks the block the model was SFT'd to read.
+#
+# So: one short factual sentence per status, from the vocabulary lean_reward._verify
+# already emits (no second vocabulary), wrapped in the /- <feedback> ... </feedback> -/
+# form the canonical annotation uses, appended AFTER the attempted code exactly as
+# _build_annotated_lean puts its single error block last. That placement matters twice:
+# the repair template can splice it straight into {failed_attempt}, and the reprompt
+# elision in _maybe_build_self_distillation_batch keeps head+tail, so an over-budget
+# fallback loses code from the middle and never the explanation.
+#
+# NO TRIPLE BACKTICKS IN ANY VALUE HERE. The text is rendered inside
+# proof_repair_template's ```lean4 fence; a fence in the note would close it early.
+# (clean_lean_code itself is fence-free by construction: it is the extracted contents of
+# a fenced block -- 0 of 6,656 measured rows contain one.)
+_LEAN_STATUS_FALLBACK_NOTE = {
+    # Wall-clock, not syntax. The code may be perfectly well formed.
+    "lean_timeout": (
+        "Lean ran out of time checking this attempt: some tactic here does not finish "
+        "within the verifier's time budget. No error was reported in the code itself."
+    ),
+    "lean_timeout_soft": (
+        "Lean ran out of time checking this attempt: some tactic here does not finish "
+        "within the verifier's time budget. No error was reported in the code itself."
+    ),
+    # Lean was never run on these three.
+    "no_lean_code": (
+        "This attempt contained no closed lean4 code block, so there was nothing to "
+        "check. The proof has to be written inside a single lean4 block."
+    ),
+    "too_long_to_verify": (
+        "This attempt was too long to send to the verifier, so it was never checked."
+    ),
+    "missing_declaration": (
+        "This attempt declares no theorem or lemma, so there is nothing for Lean to prove."
+    ),
+    # Rejected on the DECLARATION, with the proof body never adjudicated. Neither of the
+    # first two establishes that Lean accepted anything, and an earlier version of this
+    # table said it did:
+    #   wrong_declaration_name is a purely LEXICAL test in lean_reward._verify
+    #     (`expected_name not in _declaration_names(lean_code)`) that returns before
+    #     _get_or_build_problem and ~50 lines before the candidate is sent to Lean at all.
+    #   wrong_declaration returns from `if not declaration_matches`, which sits BEFORE
+    #     `is_valid = result.lean_code_is_valid(...)` -- the only LeanError check above it
+    #     rules out an infrastructure failure, not elaboration errors, so the body may be
+    #     broken as well as misnamed.
+    # Telling the teacher its broken proof compiled and was merely misnamed steers the
+    # repair toward renaming. Say only what the ladder established.
+    "wrong_declaration": (
+        "This attempt was rejected without its proof being checked: the statement it "
+        "proves is not the one the problem asks for. The requested theorem is still "
+        "unproved."
+    ),
+    "wrong_declaration_name": (
+        "This attempt does not declare the theorem the problem asks for -- it proves a "
+        "differently named statement -- so it was rejected without being checked."
+    ),
+    # This one IS post-Lean and post-is_valid (lean_reward._verify reaches it only through
+    # the `elif match_kind == "renamed"` arm below the is_valid gate), so acceptance is
+    # established here and the wording stays.
+    "renamed_declaration": (
+        "Lean accepted this code, but it proves the statement under a different "
+        "declaration name than the one the problem asks for."
+    ),
+    "wrong_context": (
+        "This attempt altered the problem's header -- its imports, options or open "
+        "namespaces -- instead of proving the stated theorem in the given context."
+    ),
+    # Elaborated without proving anything.
+    "contains_sorry": (
+        "This proof is not closed: it still admits its goal with sorry instead of "
+        "proving it."
+    ),
+    "contains_admit": (
+        "This proof is not closed: it still admits its goal with admit instead of "
+        "proving it."
+    ),
+    "escape_hatch": (
+        "This attempt does not prove the goal: it elaborates through a known escape "
+        "hatch rather than a real argument, so the theorem is still unproved."
+    ),
+    # Lean returned errors but the annotation pass produced no per-block messages.
+    "lean_rejected": "Lean reported errors on this attempt.",
+    "invalid_proof": "Lean reported errors on this attempt.",
+}
+
+# Anything the ladder can emit that is not in the table above -- including statuses whose
+# rows are normally dropped upstream by lean_valid_reward (lean_infra_failed,
+# problem_context_*). Names the status rather than inventing a description for it.
+_LEAN_STATUS_FALLBACK_DEFAULT = "Lean did not accept this attempt (verifier status: {status})."
+
+
+def _lean_status_fallback_feedback(status: str, clean_code: str) -> str:
+    """The {failed_attempt} body for a row with no canonical Lean annotation.
+
+    Same shape as canonical_annotated_code -- bare Lean source carrying
+    /- <feedback> ... </feedback> -/ blocks -- so both teacher formats consume it
+    unchanged: proof_repair_template splices it into its ```lean4 fence, and the generic
+    feedback_template quotes it as prose. One shape, no per-format branching.
+
+    clean_code is empty whenever the Lean feedback aux is off (lean_reward writes that key
+    under `if self.feedback_aux_enabled:`), and the note is then returned ALONE -- a
+    teacher context with no code, no error text and therefore no information the student
+    does not already have. Do not enable use_fallback_environment_feedback on an arm
+    without the aux; see its comment in actor.yaml.
+    """
+    note = _LEAN_STATUS_FALLBACK_NOTE.get(status, _LEAN_STATUS_FALLBACK_DEFAULT.format(status=status))
+    block = f"/- <feedback>\n{note}\n</feedback> -/"
+    code = (clean_code or "").strip()
+    return f"{code}\n\n{block}" if code else block
+
+
+# ---------------------------------------------------------------------------------
 # Metric-surface constants for _lean_reward_diagnostics.
 #
 # The last full run emitted 268 distinct step keys, of which 28 were zero on every one
@@ -427,6 +555,64 @@ _LEAN_TAIL_VALIDATION_ATTEMPTS = 8
 # One-shot guards so the estimator warnings below are not repeated every step.
 _LEAN_TAIL_ADV_WARNED = False
 _LEAN_ATTEMPT_NEUTRALIZE_ADV_WARNED = False
+_SDPO_ADV_UNUSED_WARNED = False
+
+
+def _warn_sdpo_reward_has_no_gradient_path(config) -> bool:
+    """One-shot warning: under ``loss_mode=sdpo`` the reward never reaches the loss.
+
+    Companion to the two ``adv_estimator != GRPO`` guards in :func:`compute_advantage`.
+    Those catch "the estimator changed, so the Lean features silently stopped applying".
+    They cannot catch the SDPO case, because SDPO keeps ``adv_estimator=grpo``: the
+    estimator runs, the refund runs, ``advantages`` is computed and narrowed by
+    ``lean_tail_mask``, it is selected into the actor -- and then
+    ``DataParallelPPOActor.update_policy`` takes the ``if self_distillation_enabled:``
+    branch, whose ``elif ppo_response_mask.any():`` sibling holds the ONLY read of
+    ``advantages``. The distillation KL REPLACES the policy gradient; it is not added to
+    it. So every reward-shaping term has zero gradient path in an SDPO run, while
+    ``lean/*`` and ``critic/advantages/*`` keep logging values indistinguishable from a
+    GRPO run at the same reward.
+
+    The reward still reaches SDPO through exactly two channels, neither of which is
+    sensitive to any shaping term: teacher election
+    (``_collect_solutions_by_uid``: ``reward_tensor.sum(-1) >= success_reward_threshold``)
+    and ``lean_valid_reward`` row gating of ``ppo_response_mask``.
+
+    Returns True when the warning was emitted (the first SDPO step), False otherwise.
+    """
+    global _SDPO_ADV_UNUSED_WARNED
+    if _SDPO_ADV_UNUSED_WARNED:
+        return False
+    _SDPO_ADV_UNUSED_WARNED = True
+
+    inert: list[str] = []
+    # Defensive: this function exists only to log. A config shape it did not expect must
+    # never be the thing that takes a training run down.
+    getter = getattr(config, "get", None)
+    algorithm_cfg = getter("algorithm", {}) if callable(getter) else {}
+    if not hasattr(algorithm_cfg, "get"):
+        algorithm_cfg = {}
+    if _truthy(algorithm_cfg.get("mask_after_last_lean_block", False)):
+        # Still worth keeping on -- but for a different reason than its docstring gives.
+        inert.append("algorithm.mask_after_last_lean_block (its documented rationale is "
+                     "the GRPO advantage broadcast, which does not run here)")
+    if _truthy(algorithm_cfg.get("neutralize_attempt_penalty_in_all_fail_groups", False)):
+        inert.append("algorithm.neutralize_attempt_penalty_in_all_fail_groups "
+                     "(lean/attempt_penalty_* still logs, but refunds an advantage nobody reads)")
+
+    logger.warning(
+        "loss_mode=sdpo: the self-distillation KL REPLACES the policy-gradient term "
+        "(dp_actor.update_policy: `if self_distillation_enabled:` vs the `elif "
+        "ppo_response_mask.any():` that holds the only read of `advantages`). "
+        "The reward has NO gradient path in this run: every Lean shaping term "
+        "(non-termination, the excess-block ramp, give-up, no_lean_code, timeout), the "
+        "GRPO group-std floor and the all-fail refund affect nothing but teacher "
+        "election (score >= success_reward_threshold) and lean_valid_reward row gating. "
+        "Read lean/* and critic/advantages/* as DIAGNOSTICS ONLY -- they are not "
+        "comparable to a GRPO arm's, because in that arm they drive the loss.%s",
+        ("  Inert-as-documented in this run: " + "; ".join(inert)) if inert else "",
+    )
+    return True
 
 
 def _as_int(value, default: int = -1) -> int:
@@ -1768,10 +1954,38 @@ class RayPPOTrainer:
         use_fallback_environment_feedback: bool = True,
         valid_reward_flags: Optional[list[bool]] = None,
     ) -> list[str | None]:
+        """Per-row teacher context: the row's OWN attempt, never a sibling's.
+
+        Two sources, in order. The canonical Lean annotation if the reward produced one,
+        otherwise -- when use_fallback_environment_feedback is on -- a one-sentence status
+        note from _lean_status_fallback_feedback.
+
+        VERIFIED ROWS TAKE THE CANONICAL BRANCH TOO, and that is deliberate: it is the
+        only branch that keeps a row's teacher context its own. Measured over steps
+        100-125 of qwen3-sft-feedback-grpo-lr2e6, 2,091 of 2,091 verified rows carry
+        has_canonical_feedback=True (the annotation of a verified proof is the correct
+        proof carrying proof-state blocks, not error blocks), so on an arm running
+        environment_feedback_only_without_solution=false all of them are reprompted with
+        their own proof through proof_repair_template -- ~45% of the 4,605 targets. That
+        teacher's context CONTAINS the tokens it is scoring, i.e. self-imitation at
+        maximal confidence. Sending them down the solution branch instead is strictly
+        worse for this arm: _get_solution hands out ONE demonstration per group, so 1,406
+        of them would be scored against a DIFFERENT row's proof -- the sibling proof the
+        routing decision exists to eliminate -- through the generic template the
+        checkpoint was never SFT'd on.
+
+        The `status != _LEAN_VERIFIED_STATUS` guard below therefore only governs the
+        FALLBACK: a verified row with no annotation at all (0 occurrences in 6,656 rows)
+        gets nothing rather than a status note, because there is no error to name.
+        """
         feedback_list: list[str | None] = [None] * batch_size
         if not include_environment_feedback or not reward_extra_infos_dict:
             return feedback_list
 
+        # Both of these keys are written only when LEAN_FEEDBACK_AUX is on
+        # (lean_reward.py, `if self.feedback_aux_enabled:`). On an arm without it they are
+        # absent, every row falls through to the fallback, and the fallback has no
+        # clean_lean_code to attach -- see use_fallback_environment_feedback in actor.yaml.
         canonical = reward_extra_infos_dict.get("canonical_annotated_code", [])
         has_canonical = reward_extra_infos_dict.get("has_canonical_feedback", [])
         statuses = reward_extra_infos_dict.get("lean_status", [])
@@ -1788,12 +2002,14 @@ class RayPPOTrainer:
                 continue
             if idx < len(statuses):
                 status = str(statuses[idx])
-                if status and status != "verified":
+                # Fallback only. A verified row that reached here has no annotation to
+                # describe and no error to name, so it is left without feedback;
+                # _LEAN_VERIFIED_STATUS is the single producer of that fact. This is NOT
+                # a statement that verified rows get no teacher context -- see the
+                # docstring: they take the canonical branch above.
+                if status and status != _LEAN_VERIFIED_STATUS:
                     code = clean_code[idx] if idx < len(clean_code) and isinstance(clean_code[idx], str) else ""
-                    feedback = f"Lean verifier status: {status}."
-                    if code.strip():
-                        feedback += f"\n\nAttempted Lean code:\n```lean4\n{code.strip()}\n```"
-                    feedback_list[idx] = feedback
+                    feedback_list[idx] = _lean_status_fallback_feedback(status, code)
         return feedback_list
 
     def _get_solution(
@@ -1805,15 +2021,63 @@ class RayPPOTrainer:
         dont_reprompt_on_self_success: bool,
         remove_thinking_from_demonstration: bool,
     ) -> str | None:
+        """Return the demonstration spliced into this row's teacher reprompt.
+
+        Among the group's verified siblings, the SHORTEST one. This used to be
+        solution_idxs[0] -- the first verified row in balanced-batch order, which
+        correlates with nothing. Every verified sibling is an equally valid
+        demonstration (they all passed Lean), so length is the one axis that can be
+        optimised for free, and it is not free to ignore: the reprompt is budgeted in
+        _maybe_build_self_distillation_batch (max_reprompt_len, tightened by
+        max_teacher_total_len - response_len) and an over-budget reprompt is elided in
+        the MIDDLE. Keeping head+tail is right for the repair branch, whose trailing
+        Lean error is the whole signal, and wrong here: it hands the teacher a correct
+        proof with a hole punched in it.
+
+        MEASURED by replaying this routing over the 6,656 dumped rollouts of steps
+        100-125 of qwen3-sft-feedback-grpo-lr2e6 at 20480/12288 -- solution branch
+        3,128 rows, elision counted over the 4,454 distillation targets:
+            reprompt p50   3,871 -> 2,851      p90  11,259 -> 7,564
+            reprompt mean  5,375 -> 3,878      elided 6.15% -> 2.47%  (274 -> 110 rows)
+        The elision rates are over the 4,454 target-valid rows. The logged
+        self_distillation/reprompt_elided_fraction divides by batch_size instead, where
+        the same numbers read 4.12% -> 1.65%.
+        The pick actually changes the demonstration in 60.3% of the 458 groups that
+        have one.
+
+        Length is counted in CHARACTERS of the text that is actually spliced, not in
+        tokens: token counts live in the caller (response_lengths) and this signature
+        stays put, and under remove_thinking_from_demonstration the raw response length
+        is the wrong key anyway, because the <think> span never reaches the prompt.
+        Cost of that proxy on the same rollouts: char-argmin and token-argmin agree on
+        92.4% of groups, and where they disagree it is worth 73 tokens at p90 (7,564 vs
+        7,491) and ZERO rows of elision -- 110 either way.
+
+        min() keeps the first minimum and _collect_solutions_by_uid appends in ascending
+        index order, so ties resolve to the lowest index: deterministic, and byte-identical
+        to the old pick when a group's verified rows are all the same length. Every row of
+        a group still gets the SAME demonstration.
+
+        WHAT THIS DOES NOT CHANGE: which rows get a demonstration at all. The branch
+        shares, self_distillation_mask and the metric key set are untouched. Nor does it
+        touch the dont_reprompt_on_self_success=false case where the row that owns the
+        shortest proof is handed its own proof verbatim -- that is a separate decision.
+        On the feedback arm's shipped routing this is dead code (0 of 4,605 target rows
+        reach the solution branch); the classic arm, which is entirely solution branch,
+        is what it is for.
+        """
         solution_idxs = list(success_by_uid[uids[idx]])
         if dont_reprompt_on_self_success:
             solution_idxs = [j for j in solution_idxs if j != idx]
         if not solution_idxs:
             return None
-        solution = response_texts[solution_idxs[0]]
+        candidates = [response_texts[j] for j in solution_idxs]
         if remove_thinking_from_demonstration:
-            solution = self._remove_thinking_trace(solution)
-        return solution
+            # Rank on what is spliced, not on what was generated. Costs one regex per
+            # verified sibling per row rather than one per row; the flag is off on both
+            # arms, and even on it that is ~group_size passes against a minutes-long step.
+            candidates = [self._remove_thinking_trace(text) for text in candidates]
+        return min(candidates, key=len)
 
     def _maybe_build_self_distillation_batch(
         self,
@@ -1825,6 +2089,11 @@ class RayPPOTrainer:
         loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
         if self_distillation_cfg is None or loss_mode != "sdpo":
             return None
+
+        # Fires once per run, here rather than in compute_advantage: the two guards there
+        # are gated on `adv_estimator != GRPO` and SDPO keeps adv_estimator=grpo, so they
+        # cannot see this. See _warn_sdpo_reward_has_no_gradient_path for what is inert.
+        _warn_sdpo_reward_has_no_gradient_path(self.config)
 
         device = batch.batch["input_ids"].device
         responses = batch.batch["responses"]

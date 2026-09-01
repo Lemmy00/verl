@@ -795,11 +795,26 @@ class DataParallelPPOActor(BasePPOActor):
                             loss_agg_mode=loss_agg_mode,
                             rollout_is_weights=rollout_is_weights,
                         )
-                        pg_metrics["self_distillation/empty_target_batch"] = (
-                            float(self_distillation_mask.sum().detach().item()) == 0.0
-                            if self_distillation_mask is not None
-                            else False
-                        )
+                        # "Did this micro-batch distil anything?" -- and that is the
+                        # COMPOSED mask, not the row mask alone. self_distillation_mask is
+                        # a (bsz,) row gate that compute_self_distillation_loss multiplies
+                        # into response_mask (= ppo_response_mask here, already narrowed by
+                        # the generated-<feedback> spans, the last-closed-lean-block cut and
+                        # the lean_valid_reward row zeroing). A row can therefore pass the
+                        # row gate and still contribute zero tokens, in which case this used
+                        # to report False while self_distillation/active_tokens read 0 --
+                        # the two series contradicting each other on the same micro-batch.
+                        # active_tokens is loss_mask.sum() over exactly the composed mask,
+                        # so read the answer off it rather than recomputing a weaker one.
+                        active_tokens = pg_metrics.get("self_distillation/active_tokens")
+                        if active_tokens is not None:
+                            pg_metrics["self_distillation/empty_target_batch"] = float(active_tokens) == 0.0
+                        else:  # pragma: no cover - the loss always emits active_tokens
+                            pg_metrics["self_distillation/empty_target_batch"] = (
+                                float(self_distillation_mask.sum().detach().item()) == 0.0
+                                if self_distillation_mask is not None
+                                else False
+                            )
                     elif ppo_response_mask.any():
                         # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
                         # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov

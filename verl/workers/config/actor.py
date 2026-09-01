@@ -103,6 +103,8 @@ class SelfDistillationConfig(BaseConfig):
         "Here is the complete Lean 4 proof annotated with Lean 4 compiler feedback blocks:\n\n"
         "```lean4\n{failed_attempt}\n```\n"
     )
+    # Give rows with no canonical Lean annotation a status-derived teacher context;
+    # see _lean_status_fallback_feedback and the note in actor.yaml.
     use_fallback_environment_feedback: bool = False
     include_environment_feedback: bool = True
     environment_feedback_only_without_solution: bool = True

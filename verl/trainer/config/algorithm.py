@@ -622,7 +622,7 @@ class AlgoConfig(BaseConfig):
     # trailing garbage. The one kept token is what makes stopping learnable: on a clean
     # rollout it is the EOS, on a derailed one the first garbage token. Defaults ON; set
     # False to reproduce the pre-fix behaviour. See ray_trainer.lean_tail_response_mask.
-    mask_after_last_lean_block: bool = True
+    mask_after_last_lean_block: bool = False
     use_kl_in_reward: bool = False
     kl_penalty: str = "kl"
     kl_ctrl: KLControlConfig = field(default_factory=KLControlConfig)

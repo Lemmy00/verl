@@ -222,7 +222,9 @@ class SftReplayConfig(BaseConfig):
     # Every run with replay OFF, including the whole classic arm, would have died there.
     files: Optional[str] = None
     # GLOBAL per optimizer step; dp_actor divides by the data-parallel world size.
-    samples_per_step: int = 64
+    # 128 = the 16/rank x 8 ranks of the run that demonstrably held repair -- kept as the
+    # default in the units that survive a change of GPU count.
+    samples_per_step: int = 128
     micro_batch_size: int = 2
     seed: int = 1234
 

@@ -96,8 +96,8 @@ sft_replay:
 
   # GLOBAL sequences per optimizer step; each data-parallel rank draws its share
   # (samples_per_step // world_size, min 1), so the replay:rollout ratio does not
-  # change with the GPU count.
-  samples_per_step: 64
+  # change with the GPU count. 128 = the 16/rank x 8 ranks of the run that held repair.
+  samples_per_step: 128
 
   # Chunk size for the replay forward. The main loop runs at micro_batch_size_per_gpu=1
   # because rollouts reach 30k tokens; replay rows are median ~1.5k, so a few fit at once.

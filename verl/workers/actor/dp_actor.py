@@ -612,7 +612,7 @@ class DataParallelPPOActor(BasePPOActor):
             return {}
 
         lam = float(getattr(cfg, "lambda_coef", 0.1))
-        requested = int(getattr(cfg, "samples_per_step", 64))
+        requested = int(getattr(cfg, "samples_per_step", 128))
         mb = max(int(getattr(cfg, "micro_batch_size", 1)), 1)
         if requested <= 0 or lam == 0.0:
             return {}

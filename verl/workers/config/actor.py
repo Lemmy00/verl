@@ -28,6 +28,7 @@ from .optimizer import OptimizerConfig
 __all__ = [
     "PolicyLossConfig",
     "FeedbackLossConfig",
+    "SftReplayConfig",
     "SelfDistillationConfig",
     "RouterReplayConfig",
     "ActorConfig",
@@ -201,6 +202,51 @@ class FeedbackLossConfig(BaseConfig):
 
 
 @dataclass
+class SftReplayConfig(BaseConfig):
+    """Supervised replay mixed into the actor update to anchor an RL-eroded behaviour.
+
+    Distinct from FeedbackLossConfig: that reweights tokens of the ROLLOUTS and so can only
+    shape how a rollout is written. Replay forwards separate SFT sequences, which is what it
+    takes to hold a *decision* (here: retry after a failed proof) rather than a surface form.
+
+    `files` is a PRE-TOKENISED parquet from prepare_sft_replay.py -- input_ids / prompt_len /
+    proof_repair. It is tokenizer-specific; a pool built for another model is silently wrong,
+    so there is no default path and `enabled` without `files` is refused rather than ignored.
+    """
+
+    enabled: bool = False
+    lambda_coef: float = 0.1
+    # Optional[str], NOT str. grpo.sh passes files="" on the disabled branch, and an empty
+    # Hydra override (files=) is parsed as None -- against a plain `str` field that raises
+    # ValidationError at config load and kills the launch before a single GPU is touched.
+    # Every run with replay OFF, including the whole classic arm, would have died there.
+    files: Optional[str] = None
+    # GLOBAL per optimizer step; dp_actor divides by the data-parallel world size.
+    samples_per_step: int = 64
+    micro_batch_size: int = 2
+    seed: int = 1234
+
+    def __post_init__(self):
+        if self.lambda_coef < 0.0:
+            raise ValueError(f"sft_replay.lambda_coef must be non-negative, got {self.lambda_coef}")
+        # The shape guards apply only when the feature is ON. A launcher that disables replay
+        # reasonably writes 0 across every knob to say so, and rejecting that killed the
+        # no-replay arm at config load -- before a GPU was touched -- for a value the code
+        # never reads. Same conditional shape as the `files` check below.
+        if self.enabled and self.micro_batch_size < 1:
+            raise ValueError(f"sft_replay.micro_batch_size must be >= 1, got {self.micro_batch_size}")
+        if self.enabled and self.samples_per_step < 1:
+            raise ValueError(
+                f"sft_replay.enabled=true requires samples_per_step >= 1, got {self.samples_per_step}"
+            )
+        if self.enabled and not self.files:
+            raise ValueError(
+                "sft_replay.enabled=true requires sft_replay.files. Silently training with no "
+                "replay pool would look identical to a working run in every logged metric."
+            )
+
+
+@dataclass
 class ActorConfig(BaseConfig):
     """Configuration for actor model training.
 
@@ -261,6 +307,7 @@ class ActorConfig(BaseConfig):
     freeze_vision_tower: bool = False
     policy_loss: PolicyLossConfig = field(default_factory=PolicyLossConfig)
     feedback_loss: FeedbackLossConfig = field(default_factory=FeedbackLossConfig)
+    sft_replay: SftReplayConfig = field(default_factory=SftReplayConfig)
     self_distillation: SelfDistillationConfig = field(default_factory=SelfDistillationConfig)
     clip_ratio_c: float = 3.0
     loss_agg_mode: str = "token-mean"

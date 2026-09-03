@@ -19,6 +19,7 @@ Single Process Actor
 
 import logging
 import os
+import random
 from typing import Optional
 
 import torch
@@ -63,6 +64,17 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_optimizer = actor_optimizer
         self.teacher_module: Optional[nn.Module] = None
         role = "Ref" if actor_optimizer is None else "Actor"
+
+        # SFT replay state. The pool is loaded lazily on first use so a disabled run pays
+        # nothing, and the RNG is seeded PER RANK: identical seeds would have every rank
+        # forward the same sequences, turning an N-sample step into one sample's gradient
+        # replicated N times.
+        self._sft_replay_pool: Optional[list] = None
+        _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        _sft_cfg = self.config.get("sft_replay", None)
+        _sft_seed = int(getattr(_sft_cfg, "seed", 1234)) if _sft_cfg is not None else 1234
+        self._sft_replay_seed = _sft_seed + _rank
+        self._sft_replay_rng = random.Random(self._sft_replay_seed)
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
         if torch.distributed.get_rank() == 0:
@@ -511,6 +523,206 @@ class DataParallelPPOActor(BasePPOActor):
             else:
                 self.actor_optimizer.step()
         return grad_norm
+
+    # ---------------------------------------------------------------------------------
+    # SFT replay
+    # ---------------------------------------------------------------------------------
+    # Anchors a behaviour that RL erodes, by mixing supervised cross-entropy on real SFT
+    # examples into the same optimizer step as the policy gradient.
+    #
+    # This is NOT feedback_loss. That term reweights tokens of the ROLLOUTS, so it can only
+    # anchor how a rollout is written, not what the policy chooses to do -- and it worked
+    # exactly that well: lean/feedback_quality/block_f1 held flat at 0.77-0.84 through a run
+    # in which repair_rate collapsed 0.645 -> 0.242 and give_up_rate went 0.176 -> 0.535.
+    # Replay forwards DIFFERENT sequences -- ones demonstrating "read the compiler error, try
+    # again" -- which is why it needs its own forward pass rather than a weight vector.
+    #
+    # Gradients land before _optimizer_step(), so they accumulate into the same step and are
+    # clipped by the same grad_clip. The pool is pre-tokenised by prepare_sft_replay.py: this
+    # class has no tokenizer, and tokenising in the hot loop would cost more than the forward.
+    def _load_sft_replay_pool(self, cfg) -> list:
+        if self._sft_replay_pool is not None:
+            return self._sft_replay_pool
+        files = getattr(cfg, "files", None)
+        if not files:
+            self._sft_replay_pool = []
+            return self._sft_replay_pool
+        import pandas as pd
+
+        # RAISE, do not degrade. Returning [] here would leave the run "enabled" in every
+        # logged config while contributing nothing -- the exact silent failure the config
+        # guard exists to prevent, and invisible for the ~25 steps it takes to notice that
+        # actor/sft_replay_ce was never emitted. Better to die at the first optimizer step.
+        try:
+            df = pd.read_parquet(files)
+        except Exception as exc:
+            raise RuntimeError(
+                f"sft_replay.enabled is set but the pool at {files!r} could not be read: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        n_repair = int(df["proof_repair"].sum()) if "proof_repair" in df.columns else -1
+        self._sft_replay_pool = [
+            {"input_ids": list(row.input_ids), "prompt_len": int(row.prompt_len)}
+            for row in df.itertuples()
+            # 1 <= prompt_len < len. The upper bound: a prompt covering the whole sequence
+            # has no CE target and would contribute 0/0. The LOWER bound is subtler --
+            # total_target_tokens counts len - prompt_len, but target = lbl[:, 1:] drops
+            # position 0, so at prompt_len == 0 the denominator over-counts by one and the
+            # row is silently underweighted. Pools from prepare_sft_replay.py always have
+            # prompt_len >= 1 (measured min 99), so this only guards hand-made pools.
+            if 1 <= int(row.prompt_len) < len(row.input_ids)
+        ]
+        if not self._sft_replay_pool:
+            raise RuntimeError(
+                f"sft_replay pool at {files!r} has {len(df)} rows but none usable "
+                "(every row has prompt_len >= len(input_ids)); replay would be silently inert."
+            )
+        # is_initialized() guard matches __init__: get_rank() raises outright when there is
+        # no process group, which makes the pool unloadable in any single-process context
+        # (a smoke test, a notebook, a CPU debug run).
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            # Report the repair share. It is the entire point of the pool, the builder can
+            # backfill it away when one class runs short, and it is otherwise discarded here
+            # and never visible anywhere downstream -- so a 12%-repair pool would train for
+            # hours looking exactly like the 50% one that was asked for.
+            share = f"{n_repair / max(len(df), 1):.1%}" if n_repair >= 0 else "unknown"
+            print(
+                f"SFT replay: loaded {len(self._sft_replay_pool)} sequences from {files} "
+                f"(proof_repair {share})"
+            )
+        return self._sft_replay_pool
+
+    def _sft_replay_step(self, pad_token_id: int) -> dict:
+        cfg = self.config.get("sft_replay", None)
+        if cfg is None or not bool(getattr(cfg, "enabled", False)):
+            return {}
+        # The reference policy shares this class and has no optimizer; it must never update.
+        if self.actor_optimizer is None:
+            return {}
+        # The replay forward is the plain padded path: no Ulysses pad/slice, always 2-D
+        # position_ids. Correct at sequence-parallel size 1 (this run), wrong and possibly
+        # hanging above it, so refuse rather than train something subtly incorrect.
+        if getattr(self, "use_ulysses_sp", False):
+            raise NotImplementedError(
+                "sft_replay does not support ulysses_sequence_parallel_size > 1: the replay "
+                "forward does not shard sequences. Set sft_replay.enabled=false or size=1."
+            )
+        pool = self._load_sft_replay_pool(cfg)
+        if not pool:
+            return {}
+
+        lam = float(getattr(cfg, "lambda_coef", 0.1))
+        requested = int(getattr(cfg, "samples_per_step", 64))
+        mb = max(int(getattr(cfg, "micro_batch_size", 1)), 1)
+        if requested <= 0 or lam == 0.0:
+            return {}
+        # samples_per_step is GLOBAL. Each rank draws its share, so the replay:rollout ratio
+        # is set by the config alone and does not scale 8x when the run moves from 1 GPU to
+        # 8. world and requested are identical on every rank, so every rank computes the
+        # same n and runs the same number of forward/backward calls -- no collective skew.
+        world = (
+            torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        )
+        n = min(max(requested // world, 1), len(pool))
+
+        device = get_device_id()
+        # Draw from a stream keyed on the optimizer's own step counter rather than from the
+        # long-lived RNG built in __init__. That RNG rewinds to draw zero on every resume, and
+        # this pipeline resumes often (resume_mode=auto, SAVE_FREQ=25, both prior runs died
+        # mid-flight) -- it would be the only sampling stream that rewinds, since verl already
+        # checkpoints the RL dataloader. AdamW's "step" is restored with the optimizer state,
+        # so it is monotonic across resumes with no new plumbing. Falls back to the sequential
+        # RNG before the first optimizer step, when the state dict is still empty.
+        step = None
+        try:
+            for st in self.actor_optimizer.state.values():
+                t = st.get("step")
+                if t is not None:
+                    step = int(t.item() if hasattr(t, "item") else t)
+                    break
+        except (AttributeError, TypeError):
+            step = None
+        if step is None:
+            rng = self._sft_replay_rng
+        else:
+            rng = random.Random((self._sft_replay_seed * 1_000_003) + step)
+        picks = [pool[i] for i in rng.sample(range(len(pool)), n)]
+        # Denominator for the WHOLE step, computed before the loop. Normalising per chunk
+        # instead makes the loss a per-sequence mean at micro_batch_size=1 and a per-token
+        # mean at full width -- different numbers whenever rows differ in length, which they
+        # always do (pool median 1529 tokens, p90 4138). micro_batch_size is a memory knob
+        # and must not move the gradient.
+        total_target_tokens = sum(len(r["input_ids"]) - r["prompt_len"] for r in picks)
+        if total_target_tokens <= 0:
+            return {}
+        total_ce, total_tok = 0.0, 0
+
+        for start in range(0, n, mb):
+            chunk = picks[start : start + mb]
+            width = max(len(r["input_ids"]) for r in chunk)
+            ids = torch.full((len(chunk), width), pad_token_id, dtype=torch.long, device=device)
+            att = torch.zeros((len(chunk), width), dtype=torch.long, device=device)
+            lbl = torch.full((len(chunk), width), -100, dtype=torch.long, device=device)
+            for i, r in enumerate(chunk):
+                seq, plen = r["input_ids"], r["prompt_len"]
+                ids[i, : len(seq)] = torch.as_tensor(seq, dtype=torch.long, device=device)
+                att[i, : len(seq)] = 1
+                # Only the answer is a target. Training the model to reproduce the problem
+                # statement would spend the replay budget on text it is already given.
+                lbl[i, plen : len(seq)] = ids[i, plen : len(seq)]
+            position_ids = (att.cumsum(dim=-1) - 1).clamp(min=0)
+
+            with torch.autocast(device_type=self.device_name, dtype=self.param_dtype):
+                out = self.actor_module(
+                    input_ids=ids,
+                    attention_mask=att,
+                    position_ids=position_ids,
+                    use_cache=False,
+                )
+            logits = out.logits[:, :-1, :]
+            target = lbl[:, 1:]
+            valid = target != -100
+            # NOT F.cross_entropy on .float() logits. At vocab 151,936 a worst-case chunk
+            # (2 x 6144 tokens) costs 3.7 GB for the bf16 logits plus 7.5 GB for the float32
+            # copy plus another 7.5 GB for log_softmax inside CE -- ~19 GB of transient peak
+            # on a run that already sits at 70-122 GB of 143 GB. logprobs_from_logits is the
+            # utility the main path uses: flash-attn CE with in-place backward where
+            # available, row-wise chunking otherwise, and it never materialises a full
+            # float32 softmax. Targets are clamped because -100 is not a gatherable index;
+            # the mask, not the index, is what excludes them.
+            logp = logprobs_from_logits(logits, target.masked_fill(~valid, 0))
+            # torch.where, NOT `logp * valid`. Masked positions carry the log-prob of the
+            # filler index 0, which at vocab 151,936 in bf16 can underflow to -inf -- and
+            # -inf * False is NaN, not 0. One such position turns the whole step's loss into
+            # NaN, and the gradient with it. Verified: (logp * valid).sum() -> nan where
+            # torch.where(...).sum() -> the correct value.
+            # sum(dtype=float32): with two 6144-token rows at initial CE ~log(151936)=11.9
+            # the sum reaches ~1.5e5, past fp16's finite range -- and an inf here happens
+            # BEFORE ShardedGradScaler.scale(), which a lower scale factor cannot repair.
+            # bfloat16 (this run) is unaffected; the promotion is on the [B,T] logprob
+            # tensor, not the vocab logits, so it costs nothing.
+            ce_sum = -torch.where(valid, logp, torch.zeros_like(logp)).sum(dtype=torch.float32)
+            n_tok = valid.sum()
+            # Divided by the step's TOTAL target tokens, not this chunk's, so the chunks sum
+            # to one token-weighted mean CE regardless of how they were split.
+            loss = lam * ce_sum / float(total_target_tokens)
+            if self.scaler is not None:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
+            total_ce += ce_sum.detach().item()
+            total_tok += int(n_tok.item())
+
+        if total_tok == 0:
+            return {}
+        mean_ce = total_ce / total_tok
+        return {
+            "actor/sft_replay_ce": mean_ce,
+            "actor/sft_replay_loss": lam * mean_ce,
+            "actor/sft_replay_tokens": float(total_tok),
+            "actor/sft_replay_lambda": lam,
+        }
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def compute_log_prob(self, data: DataProto, calculate_entropy: bool = False) -> dict[str, torch.Tensor]:
@@ -1034,6 +1246,13 @@ class DataParallelPPOActor(BasePPOActor):
 
                     metrics["actor/pg_loss"] += pg_loss.detach().item() * loss_scale_factor
                     append_to_dict(metrics, micro_batch_metrics)
+
+                # Before the optimizer step, so replay gradients accumulate into this same
+                # step and are clipped by the same grad_clip rather than forming an
+                # unclipped second update.
+                sft_replay_metrics = self._sft_replay_step(pad_token_id)
+                if sft_replay_metrics:
+                    append_to_dict(metrics, sft_replay_metrics)
 
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}

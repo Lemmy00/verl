@@ -75,6 +75,37 @@ policy_loss:
   # KL divergence penalty coefficient
   ppo_kl_coef: 0.1
 
+# Supervised replay: CE on real SFT sequences, mixed into the same optimizer step as the
+# policy gradient. Anchors a DECISION (retry after a failed proof) that feedback_loss cannot,
+# because feedback_loss only reweights tokens of the rollouts. Note this is unrelated to
+# router_replay, which is MoE routing.
+sft_replay:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.workers.config.SftReplayConfig
+
+  # Whether to mix supervised replay into the actor update
+  enabled: false
+
+  # Multiplier on the per-token replay CE
+  lambda_coef: 0.1
+
+  # Pre-tokenised pool from prepare_sft_replay.py. Tokenizer-specific; enabled without this
+  # is a hard error rather than a silent no-op.
+  files: ""
+
+  # GLOBAL sequences per optimizer step; each data-parallel rank draws its share
+  # (samples_per_step // world_size, min 1), so the replay:rollout ratio does not
+  # change with the GPU count.
+  samples_per_step: 64
+
+  # Chunk size for the replay forward. The main loop runs at micro_batch_size_per_gpu=1
+  # because rollouts reach 30k tokens; replay rows are median ~1.5k, so a few fit at once.
+  micro_batch_size: 2
+
+  # Offset per rank so ranks forward different sequences
+  seed: 1234
+
 # Auxiliary CE loss over canonical Lean feedback blocks
 feedback_loss:
 

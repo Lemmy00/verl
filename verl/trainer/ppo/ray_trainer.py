@@ -147,6 +147,14 @@ def _truthy(value) -> bool:
     return bool(value)
 
 
+# Variables promoted to val-core ALONGSIDE the usual single core_var. lean_verified is a 0/1
+# float emitted by the Lean reward manager, so its mean@1 is exactly the held-out success
+# rate. It has to be an explicit allow-list rather than "anything that looks like accuracy":
+# every numeric field in reward_extra_info reaches this function, and the Lean manager emits
+# dozens, so a heuristic would flood val-core.
+_EXTRA_VAL_CORE_VARS = {"lean_verified"}
+
+
 def _lean_valid_reward_mask(reward_extra_infos_dict: dict, length: int, device: torch.device) -> torch.Tensor | None:
     valid_flags = reward_extra_infos_dict.get("lean_valid_reward", None)
     if valid_flags is None or len(valid_flags) != length:
@@ -3253,11 +3261,19 @@ class RayPPOTrainer:
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
             core_var = "acc" if "acc" in var2metric2val else "reward"
+            # Upstream promotes exactly ONE variable to val-core. For Lean that is not enough:
+            # `reward` is the SHAPED score and is not the success rate -- measured at step 50,
+            # reward/mean@1 = 0.1848 against a true verified rate of 0.2920, because failures
+            # carry negative scores. The obvious trick of naming the field "acc" would make it
+            # core_var and DEMOTE reward to val-aux, renaming a series this programme has been
+            # tracking for weeks. So promote additively instead: these names join val-core
+            # without displacing whatever core_var already is.
+            core_vars = {core_var} | (_EXTRA_VAL_CORE_VARS & set(var2metric2val))
             for var_name, metric2val in var2metric2val.items():
                 n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
                 for metric_name, metric_val in metric2val.items():
                     if (
-                        (var_name == core_var)
+                        (var_name in core_vars)
                         and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
                         and (f"@{n_max}" in metric_name)
                     ):

@@ -93,9 +93,11 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     Returns:
         A dictionary of metrics including:
             - critic/score/mean, max, min: Statistics about sequence scores
-            - critic/rewards/mean, max, min: Statistics about sequence rewards
+            - critic/rewards/mean, max, min: Statistics about sequence rewards (only when they
+              differ from the scores, i.e. when a KL penalty is applied in-reward)
             - critic/advantages/mean, max, min: Statistics about advantages
-            - critic/returns/mean, max, min: Statistics about returns
+            - critic/returns/mean, max, min: Statistics about returns (only when they differ
+              from the advantages; under GRPO-family estimators returns ARE the advantages)
             - critic/values/mean, max, min: Statistics about critic values (if use_critic=True)
             - critic/vf_explained_var: Explained variance of the value function (if use_critic=True)
             - response_length/mean, max, min, clip_ratio: Statistics about response lengths
@@ -157,23 +159,48 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     else:
         raise ValueError("All samples are aborted, this should not happen.")
 
+    # De-duplication: with KL applied in the loss rather than in the reward,
+    # token_level_rewards is a verbatim copy of token_level_scores; with a GRPO-family
+    # estimator, returns is a verbatim copy of advantages. Measured on the last run these
+    # six critic/* keys were byte-identical to their twins on every step. Exact tensor
+    # equality is the test, so any configuration in which the pairs genuinely diverge
+    # (kl-in-reward, GAE) publishes both families exactly as before -- and for a given
+    # config the outcome is the same on every step, so no series flickers.
+    rewards_are_scores = torch.equal(sequence_reward, sequence_score)
+    returns_are_advantages = torch.equal(valid_returns, valid_adv)
+    # Same shape of duplication: with no aborted samples the non_aborted view IS the full
+    # batch, and this pipeline (synchronous rollouts) never aborts.
+    has_aborted = bool(aborted_mask.any())
+
     metrics = {
         # score
         "critic/score/mean": score_mean,
         "critic/score/max": score_max,
         "critic/score/min": score_min,
-        # reward
-        "critic/rewards/mean": reward_mean,
-        "critic/rewards/max": reward_max,
-        "critic/rewards/min": reward_min,
+        # reward (suppressed while identical to score, see above)
+        **(
+            {}
+            if rewards_are_scores
+            else {
+                "critic/rewards/mean": reward_mean,
+                "critic/rewards/max": reward_max,
+                "critic/rewards/min": reward_min,
+            }
+        ),
         # adv
         "critic/advantages/mean": torch.mean(valid_adv).detach().item(),
         "critic/advantages/max": torch.max(valid_adv).detach().item(),
         "critic/advantages/min": torch.min(valid_adv).detach().item(),
-        # returns
-        "critic/returns/mean": torch.mean(valid_returns).detach().item(),
-        "critic/returns/max": torch.max(valid_returns).detach().item(),
-        "critic/returns/min": torch.min(valid_returns).detach().item(),
+        # returns (suppressed while identical to advantages, see above)
+        **(
+            {}
+            if returns_are_advantages
+            else {
+                "critic/returns/mean": torch.mean(valid_returns).detach().item(),
+                "critic/returns/max": torch.max(valid_returns).detach().item(),
+                "critic/returns/min": torch.min(valid_returns).detach().item(),
+            }
+        ),
         **(
             {
                 # values
@@ -193,12 +220,19 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "response_length/clip_ratio": torch.mean(torch.eq(response_length, max_response_length).float())
         .detach()
         .item(),
-        # response length (non-aborted only)
+        # response length (non-aborted only; suppressed while nothing aborted, when the
+        # four keys are the response_length/* family verbatim)
         # These statistics exclude aborted samples to avoid skew from zeros
-        "response_length_non_aborted/mean": non_aborted_response_length_mean,
-        "response_length_non_aborted/max": non_aborted_response_length_max,
-        "response_length_non_aborted/min": non_aborted_response_length_min,
-        "response_length_non_aborted/clip_ratio": non_aborted_response_length_clip_ratio,
+        **(
+            {
+                "response_length_non_aborted/mean": non_aborted_response_length_mean,
+                "response_length_non_aborted/max": non_aborted_response_length_max,
+                "response_length_non_aborted/min": non_aborted_response_length_min,
+                "response_length_non_aborted/clip_ratio": non_aborted_response_length_clip_ratio,
+            }
+            if has_aborted
+            else {}
+        ),
         # aborted ratio
         # Fraction of samples whose response length is zero
         "response/aborted_ratio": aborted_ratio,

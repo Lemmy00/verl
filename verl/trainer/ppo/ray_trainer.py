@@ -1584,7 +1584,9 @@ class RayPPOTrainer:
                 dump_path=rollout_data_dir,
             )
 
-    def _lean_reward_diagnostics(self, reward_tensor: torch.Tensor, reward_extra_infos_dict: dict) -> dict[str, Any]:
+    def _lean_reward_diagnostics(
+        self, reward_tensor: torch.Tensor, reward_extra_infos_dict: dict, uids=None
+    ) -> dict[str, Any]:
         metrics: dict[str, Any] = {}
         if not reward_extra_infos_dict:
             return metrics
@@ -1620,6 +1622,20 @@ class RayPPOTrainer:
             # 226 steps of the last run, by construction (same numerator, same
             # denominator). Dropped; read lean/status_rate/verified.
             metrics["lean/infra_failure_rate"] = sum("infra" in str(status) for status in statuses) / total
+
+        # Problem solved rate: the fraction of PROMPTS (uid groups) with at least one
+        # verified rollout -- pass@n over the group, where lean/status_rate/verified is
+        # pass@1 over rollouts. The two answer different questions: verified-rate rises
+        # when the policy re-solves problems it already solves more often per group, while
+        # this series rises only when a NEW problem gets its first solution. It is also
+        # the exploration floor the all-fail-group refund keys on: a group counted 0 here
+        # is a group whose advantage carries no learning signal beyond the penalties.
+        if uids is not None and statuses and len(uids) == len(statuses):
+            group_solved: dict = {}
+            for uid, status in zip(uids, statuses):
+                group_solved[uid] = group_solved.get(uid, False) or (status == "verified")
+            if group_solved:
+                metrics["lean/solved_rate"] = sum(group_solved.values()) / len(group_solved)
 
         # Self-repair rate: the fraction of rollouts that completed a SECOND attempt.
         # Logged live because it is the earliest and sharpest collapse signal we have. In
@@ -4022,7 +4038,13 @@ class RayPPOTrainer:
 
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
-                        metrics.update(self._lean_reward_diagnostics(reward_tensor, reward_extra_infos_dict))
+                        metrics.update(
+                            self._lean_reward_diagnostics(
+                                reward_tensor,
+                                reward_extra_infos_dict,
+                                uids=batch.non_tensor_batch.get("uid"),
+                            )
+                        )
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)

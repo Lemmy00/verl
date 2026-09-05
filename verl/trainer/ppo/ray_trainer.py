@@ -1637,6 +1637,16 @@ class RayPPOTrainer:
             if group_solved:
                 metrics["lean/solved_rate"] = sum(group_solved.values()) / len(group_solved)
 
+        # Mixed-script corruption rate. In the kl-0.01-reply collapse this was the earliest
+        # alarm on record: first flagged rollout at step 71, 105/1024 by step 74, 218 by 76,
+        # while lean/repair_rate did not die until 76+ and validation moved by 3 proofs.
+        # The flag is computed per-row by the reward manager (mixed_script_corruption in
+        # lean_reward.py, replicating the offline forensics exactly); anything nonzero here
+        # deserves a look at the flagged rows before the next dozen steps are spent.
+        corruption = numeric_values("corruption_flag")
+        if corruption:
+            metrics["lean/corruption_rate"] = float(np.mean(corruption))
+
         # Self-repair rate: the fraction of rollouts that completed a SECOND attempt.
         # Logged live because it is the earliest and sharpest collapse signal we have. In
         # qwen3-lean-feedback-grpo-v2 it rose 0.4% -> 68.4% by step 120, then fell to 0.4% by
@@ -1948,6 +1958,69 @@ class RayPPOTrainer:
             metrics["lean/reward_mean"] = loss_reward_mean
 
         metrics.update(_lean_feedback_quality_metrics(reward_extra_infos_dict))
+        return metrics
+
+    def _lean_advantage_diagnostics(self, batch: DataProto) -> dict[str, Any]:
+        """Post-refund advantage means by behavior class, from the ACTUAL advantages tensor.
+
+        Both post-mortems of the kl-0.01-reply collapse reconstructed these numbers offline,
+        and both got them wrong on the first pass -- the dumps' lean_score_for_loss is
+        PRE-refund (the all-fail-group refund lands on a local copy inside
+        compute_grpo_outcome_advantage), and the trainer uses sample std (torch.std,
+        correction=1), not population std. Reading batch.batch["advantages"] after
+        compute_advantage sidesteps every one of those traps: whatever the estimator, the
+        floor, and the refund actually did IS what this reports.
+
+        The split is the one the corrected analysis showed matters. Over the healthy steps
+        55-70, 2-4-attempt rollouts averaged POSITIVE advantage (+0.04..+0.19) while 5+
+        flailers carried -0.16..-0.63 -- a combined "repair class" mean conflates a behavior
+        worth keeping with one being priced out, and the combined number misled a whole
+        collapse post-mortem. Counts are always emitted (a class draining to zero IS the
+        signal); means only when the class is populated, so no NaN series.
+        """
+        metrics: dict[str, Any] = {}
+        adv_t = batch.batch.get("advantages", None)
+        mask_t = batch.batch.get("response_mask", None)
+        ntb = batch.non_tensor_batch
+        blocks_arr = ntb.get("lean_closed_blocks", None)
+        verified_arr = ntb.get("lean_verified", None)
+        if adv_t is None or mask_t is None or blocks_arr is None or verified_arr is None:
+            return metrics
+        n = adv_t.shape[0]
+        if len(blocks_arr) != n or len(verified_arr) != n:
+            return metrics
+
+        mask = mask_t.to(adv_t.dtype)
+        tokens = mask.sum(dim=-1)
+        # GRPO advantages are constant over a row's response tokens, so the masked mean is
+        # exactly that constant; under any other estimator it is still the row's mean
+        # advantage, which is the right per-sequence scalar for seq-mean aggregation.
+        row_adv = ((adv_t * mask).sum(dim=-1) / tokens.clamp(min=1)).detach().cpu()
+
+        rows = []
+        for i in range(n):
+            if tokens[i].item() <= 0:
+                continue  # aux/padded rows carry no advantage
+            try:
+                blocks = int(float(blocks_arr[i]))
+                verified = _truthy(verified_arr[i])
+            except (TypeError, ValueError):
+                continue
+            rows.append((float(row_adv[i].item()), blocks, verified))
+        if not rows:
+            return metrics
+
+        def emit(key: str, pred) -> None:
+            vals = [a for a, blocks, verified in rows if pred(blocks, verified)]
+            metrics[f"lean/adv/{key}_n"] = float(len(vals))
+            if vals:
+                metrics[f"lean/adv/{key}"] = float(np.mean(vals))
+
+        emit("one_shot", lambda blocks, verified: blocks == 1)
+        emit("repair_2_4", lambda blocks, verified: 2 <= blocks <= 4)
+        emit("repair_5plus", lambda blocks, verified: blocks >= 5)
+        emit("repair_success", lambda blocks, verified: blocks >= 2 and verified)
+        emit("repair_fail", lambda blocks, verified: blocks >= 2 and not verified)
         return metrics
 
     @staticmethod
@@ -4221,6 +4294,10 @@ class RayPPOTrainer:
                             config=self.config.algorithm,
                         )
                         metrics.update(batch.meta_info.pop("lean_attempt_neutralize_stats", {}))
+                        # After compute_advantage on purpose: these read the refunded,
+                        # floored advantages the update will actually use, which no offline
+                        # reconstruction from the dumps has managed to get right first try.
+                        metrics.update(self._lean_advantage_diagnostics(batch))
 
                     # update critic
                     if self.use_critic:

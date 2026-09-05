@@ -18,6 +18,7 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import codecs
 import json
 import logging
 import math
@@ -433,6 +434,63 @@ def _lean_feedback_quality_metrics(reward_extra_infos_dict: dict) -> dict[str, f
     return metrics
 
 
+def _lean_construction_metrics(reward_extra_infos_dict: dict) -> dict[str, float]:
+    """Separate detected construction violations from charges and verified exemptions.
+
+    Rates use valid reward rows within the named population as their denominator.
+    Optional columns must cover every row; a missing or short column is not a zero.
+    Uncertain classifications are reported independently and never interpreted here as
+    construction failures. Detailed reasons and attempt records remain in the dumps.
+    """
+    verified_flags = reward_extra_infos_dict.get("lean_verified")
+    if verified_flags is None or len(verified_flags) == 0:
+        return {}
+    n = len(verified_flags)
+    valid_flags = reward_extra_infos_dict.get("lean_valid_reward")
+    if valid_flags is not None and len(valid_flags) != n:
+        return {}
+    valid = [i for i in range(n) if valid_flags is None or _truthy(valid_flags[i])]
+    if not valid:
+        return {}
+    populations = {
+        "": valid,
+        "verified_": [i for i in valid if _truthy(verified_flags[i])],
+        "failed_": [i for i in valid if not _truthy(verified_flags[i])],
+    }
+    metrics = {}
+    for field, stem in (
+        ("lean_construction_detected", "construction/detected"),
+        ("lean_duplicate_detected", "duplicate/detected"),
+        ("lean_construction_uncertain", "construction/uncertain"),
+    ):
+        flags = reward_extra_infos_dict.get(field)
+        if flags is None or len(flags) != n:
+            continue
+        category, name = stem.split("/")
+        for population, indices in populations.items():
+            count = sum(_truthy(flags[i]) for i in indices)
+            metrics[f"lean/{category}/{population}{name}_n"] = float(count)
+            if indices:
+                metrics[f"lean/{category}/{population}{name}_rate"] = count / len(indices)
+
+    amounts = reward_extra_infos_dict.get("lean_construction_penalty")
+    if amounts is not None and len(amounts) == n:
+        try:
+            charges = [float(amount) for amount in amounts]
+        except (TypeError, ValueError):
+            return metrics
+        if all(np.isfinite(charges[i]) and charges[i] >= 0 for i in valid):
+            for population, indices in populations.items():
+                count = sum(charges[i] > 0 for i in indices)
+                metrics[f"lean/construction/{population}charged_n"] = float(count)
+                if indices:
+                    metrics[f"lean/construction/{population}charged_rate"] = count / len(indices)
+                    metrics[f"lean/construction/{population}penalty_mean"] = float(
+                        np.mean([charges[i] for i in indices])
+                    )
+    return metrics
+
+
 def _lean_attempt_penalty_inputs(
     data: DataProto, length: int, device: torch.device
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
@@ -681,9 +739,7 @@ def build_token_byte_lengths(tokenizer) -> Optional[np.ndarray]:
     GPT-2 byte->unicode map, which is one CHARACTER PER BYTE, so the surface length in the
     vocab IS the byte length. Building this table once turns the offset -> token index
     mapping into a cumsum + searchsorted over the ORIGINAL response ids: exact, cheap, and
-    free of the assumption the feedback-span path makes (_proof_action_response_mask
-    decodes, re-encodes, and trusts that offsets[i] lines up with responses[i]; it already
-    counts its own violations in feedback/generated_feedback_tokenizer_mismatch_rows).
+    independent of whether re-encoding the decoded text recovers the sampled token ids.
 
     Special ids contribute 0 so the table matches skip_special_tokens=True, which is what
     the reward manager decoded with. Returns None when the tokenizer will not hand over a
@@ -766,6 +822,88 @@ def _gpt2_byte_decoder() -> dict:
             mapped.append(256 + extra)
             extra += 1
     return {chr(code): byte for byte, code in zip(printable, mapped)}
+
+
+def _build_feedback_token_bytes(tokenizer) -> Optional[dict[int, bytes]]:
+    """Recover original token bytes for a ByteLevel decoder, including added tokens."""
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    decoder = getattr(backend, "decoder", None)
+    if decoder is None or type(decoder).__name__ != "ByteLevel":
+        return None
+    byte_decoder = _gpt2_byte_decoder()
+    try:
+        added = getattr(tokenizer, "added_tokens_decoder", None) or {}
+        special_ids = set(getattr(tokenizer, "all_special_ids", None) or [])
+        table = {}
+        for surface, token_id in tokenizer.get_vocab().items():
+            if token_id in special_ids:
+                table[token_id] = b""
+            elif token_id in added:
+                table[token_id] = str(added[token_id].content).encode("utf-8")
+            else:
+                table[token_id] = bytes(byte_decoder[char] for char in surface)
+        return table
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def _utf8_replacement_byte_boundaries(raw: bytes) -> list[int]:
+    """Map characters in a lossy UTF-8 decode back to their original byte boundaries.
+
+    This slower path is only needed for invalid UTF-8. Re-encoding U+FFFD would lose
+    how many original bytes it replaced. Feeding one byte at a time lets the decoder
+    identify the consumed prefix, excluding any bytes still buffered. If a feed emits
+    several characters, only the first can consume multiple bytes; the others are
+    single invalid bytes or the current ASCII byte. Final flush can also emit several
+    replacements (for example ED A0).
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    boundaries = [0]
+    for index, byte in enumerate(raw):
+        chars = decoder.decode(bytes([byte]), final=False)
+        if chars:
+            end = index + 1 - len(decoder.getstate()[0])
+            boundaries.extend(range(end - len(chars) + 1, end + 1))
+    chars = decoder.decode(b"", final=True)
+    boundaries.extend(range(len(raw) - len(chars) + 1, len(raw) + 1))
+    return boundaries
+
+
+def _feedback_token_indices_from_bytes(token_ids, text, spans, token_bytes) -> Optional[list[int]]:
+    """Map feedback spans onto sampled ids; reject any unverified decoder mapping."""
+    if token_bytes is None:
+        return None
+    try:
+        pieces = [token_bytes[token_id] for token_id in token_ids]
+    except KeyError:
+        return None
+    raw = b"".join(pieces)
+    if raw.decode("utf-8", errors="replace") != text:
+        return None
+
+    if raw == text.encode("utf-8"):
+        # Spans are merged and sorted. Encode each prefix segment only once.
+        byte_spans = []
+        char_end = byte_end = 0
+        for start, end in spans:
+            byte_start = byte_end + len(text[char_end:start].encode("utf-8"))
+            byte_end = byte_start + len(text[start:end].encode("utf-8"))
+            byte_spans.append((byte_start, byte_end))
+            char_end = end
+    else:
+        boundaries = _utf8_replacement_byte_boundaries(raw)
+        if len(boundaries) != len(text) + 1:
+            return None
+        byte_spans = [(boundaries[start], boundaries[end]) for start, end in spans]
+
+    ends = np.cumsum([len(piece) for piece in pieces], dtype=np.int64)
+    starts = ends - np.asarray([len(piece) for piece in pieces], dtype=np.int64)
+    masked = np.zeros(len(token_ids), dtype=bool)
+    for start, end in byte_spans:
+        masked |= (starts < end) & (ends > start)
+    # Skipped special tokens have no text, even when placed inside a feedback span.
+    masked &= ends > starts
+    return np.flatnonzero(masked).tolist()
 
 
 def build_token_trailing_ws_bytes(tokenizer, token_byte_len) -> Optional[np.ndarray]:
@@ -1814,17 +1952,10 @@ class RayPPOTrainer:
             metrics["lean/excess_block_penalty_mean"] = float(np.mean(excess_charges))
             metrics["lean/excess_block_rate"] = float(np.mean([c > 0 for c in excess_charges]))
 
-        # The give-up charge: failed, exactly one closed block, no trailing unclosed
-        # opener. Its own rate series rather than only its contribution to
-        # lean/penalty_total_mean, because after the all-fail neutralisation below
-        # (neutralize_attempt_penalty_in_all_fail_groups) the excess ramp is REFUNDED
-        # inside all-fail groups -- 44.1% of groups at the time of measurement -- which
-        # leaves this charge as the only per-row shaping term still separating rows
-        # there. It is the single term the (D)+(G) pair is betting on, so it is the last
-        # one that should be invisible. Folded into penalty_total it is
-        # indistinguishable from non-termination: at the measured 16.4% incidence it is
-        # 0.164 * 0.05 = 0.0082 of mean reward, well under the non-termination term's
-        # contribution, so nothing separates "firing as designed" from "never fires".
+        # Actual give-up charge, after any construction replacement. A cap-truncated
+        # retry can be exempt, while a self-terminated dangling opener cannot. Keep this
+        # separate from construction and nontermination: only the excess-attempt charge
+        # is refunded inside all-fail groups.
         give_up_charges = numeric_values("lean_give_up_penalty")
         if give_up_charges:
             metrics["lean/give_up_penalty_mean"] = float(np.mean(give_up_charges))
@@ -1958,6 +2089,7 @@ class RayPPOTrainer:
             metrics["lean/reward_mean"] = loss_reward_mean
 
         metrics.update(_lean_feedback_quality_metrics(reward_extra_infos_dict))
+        metrics.update(_lean_construction_metrics(reward_extra_infos_dict))
         return metrics
 
     def _lean_advantage_diagnostics(self, batch: DataProto) -> dict[str, Any]:
@@ -1991,27 +2123,40 @@ class RayPPOTrainer:
             return metrics
 
         mask = mask_t.to(adv_t.dtype)
+        tail_mask = batch.batch.get("lean_tail_mask", None)
+        if tail_mask is not None:
+            # GRPO broadcasts the scalar only inside this mask. Dividing by the full
+            # response length would dilute the reported advantage on long garbage tails.
+            mask = mask * tail_mask.to(mask.dtype)
         tokens = mask.sum(dim=-1)
         # GRPO advantages are constant over a row's response tokens, so the masked mean is
         # exactly that constant; under any other estimator it is still the row's mean
         # advantage, which is the right per-sequence scalar for seq-mean aggregation.
         row_adv = ((adv_t * mask).sum(dim=-1) / tokens.clamp(min=1)).detach().cpu()
 
+        valid_arr = ntb.get("lean_valid_reward", None)
+        if valid_arr is not None and len(valid_arr) != n:
+            return metrics
         rows = []
         for i in range(n):
             if tokens[i].item() <= 0:
                 continue  # aux/padded rows carry no advantage
+            if valid_arr is not None and not _truthy(valid_arr[i]):
+                continue  # infrastructure failures are not policy failures
             try:
                 blocks = int(float(blocks_arr[i]))
                 verified = _truthy(verified_arr[i])
             except (TypeError, ValueError):
                 continue
-            rows.append((float(row_adv[i].item()), blocks, verified))
+            rows.append((float(row_adv[i].item()), blocks, verified, i))
         if not rows:
             return metrics
 
-        def emit(key: str, pred) -> None:
-            vals = [a for a, blocks, verified in rows if pred(blocks, verified)]
+        def emit(key: str, pred, indices=None) -> None:
+            vals = [
+                a for a, blocks, verified, i in rows
+                if pred(blocks, verified) and (indices is None or i in indices)
+            ]
             metrics[f"lean/adv/{key}_n"] = float(len(vals))
             if vals:
                 metrics[f"lean/adv/{key}"] = float(np.mean(vals))
@@ -2021,6 +2166,22 @@ class RayPPOTrainer:
         emit("repair_5plus", lambda blocks, verified: blocks >= 5)
         emit("repair_success", lambda blocks, verified: blocks >= 2 and verified)
         emit("repair_fail", lambda blocks, verified: blocks >= 2 and not verified)
+        for key, lower, upper in (("one_shot", 1, 1), ("repair_2_4", 2, 4), ("repair_5plus", 5, math.inf)):
+            emit(f"{key}_verified", lambda blocks, verified, lo=lower, hi=upper: lo <= blocks <= hi and verified)
+            emit(f"{key}_failed", lambda blocks, verified, lo=lower, hi=upper: lo <= blocks <= hi and not verified)
+
+        for field, key in (
+            ("lean_construction_detected", "construction"),
+            ("lean_duplicate_detected", "duplicate"),
+            ("lean_construction_uncertain", "construction_uncertain"),
+        ):
+            flags = ntb.get(field)
+            if flags is None or len(flags) != n:
+                continue
+            indices = {i for i in range(n) if _truthy(flags[i])}
+            emit(key, lambda blocks, verified: True, indices)
+            emit(f"{key}_verified", lambda blocks, verified: verified, indices)
+            emit(f"{key}_failed", lambda blocks, verified: not verified, indices)
         return metrics
 
     @staticmethod
@@ -2492,6 +2653,9 @@ class RayPPOTrainer:
         masked_tokens = 0
         feedback_rows = 0
         mismatch_rows = 0
+        byte_alignment_rows = 0
+        alignment_failed_rows = 0
+        special_ids = set(getattr(self.tokenizer, "all_special_ids", None) or [])
 
         responses_cpu = responses.detach().cpu()
         response_lengths = response_mask.detach().sum(dim=1).long().cpu().tolist()
@@ -2506,6 +2670,11 @@ class RayPPOTrainer:
                 continue
 
             feedback_rows += 1
+            # decode(skip_special_tokens=True) can omit tokens anywhere in the row.
+            # Even a canonical re-encoding must map back through the original indices.
+            visible_indices = [index for index, token_id in enumerate(token_ids) if token_id not in special_ids]
+            visible_ids = [token_ids[index] for index in visible_indices]
+            masked_indices = None
             try:
                 encoded = self.tokenizer(
                     text,
@@ -2515,29 +2684,51 @@ class RayPPOTrainer:
                     return_offsets_mapping=True,
                 )
                 offsets = list(encoded.get("offset_mapping", []))
+                encoded_ids = list(encoded.get("input_ids", []))
+                if encoded_ids == visible_ids and len(offsets) == len(visible_ids):
+                    masked_indices = [
+                        visible_indices[index]
+                        for index, (start, end) in enumerate(offsets)
+                        if end > start and _span_overlaps(start, end, spans)
+                    ]
             except Exception:
-                mismatch_rows += 1
-                continue
+                # Unsupported offset mappings can still use verified original bytes.
+                pass
 
-            if abs(len(offsets) - valid_len) > 2:
+            if masked_indices is None:
                 mismatch_rows += 1
-
-            limit = min(valid_len, len(offsets), max_response_len)
-            for token_idx in range(limit):
-                start, end = offsets[token_idx]
-                if end <= start:
+                token_bytes = getattr(self, "_feedback_token_bytes", _UNSET)
+                if token_bytes is _UNSET:
+                    token_bytes = _build_feedback_token_bytes(self.tokenizer)
+                    self._feedback_token_bytes = token_bytes
+                masked_indices = _feedback_token_indices_from_bytes(token_ids, text, spans, token_bytes)
+                if masked_indices is None:
+                    # Keep the original response mask rather than inventing an alignment.
+                    # Dropping the whole PPO row would also disable its reference KL.
+                    alignment_failed_rows += 1
                     continue
-                if _span_overlaps(start, end, spans):
-                    if action_mask[row_idx, token_idx] != 0:
-                        masked_tokens += 1
-                    action_mask[row_idx, token_idx] = 0
+                byte_alignment_rows += 1
+
+            if masked_indices:
+                masked_tokens += len(masked_indices)
+                action_mask[row_idx, masked_indices] = 0
 
         if feedback_rows:
             denom = max(float(response_mask.sum().detach().item()), 1.0)
             metrics["feedback/generated_feedback_rows"] = feedback_rows
             metrics["feedback/generated_feedback_masked_tokens"] = float(masked_tokens)
             metrics["feedback/generated_feedback_masked_token_rate"] = float(masked_tokens) / denom
+            # Counts exact ID/offset mismatches, including equal-length re-tokenizations.
             metrics["feedback/generated_feedback_tokenizer_mismatch_rows"] = mismatch_rows
+            metrics["feedback/generated_feedback_byte_alignment_rows"] = byte_alignment_rows
+            metrics["feedback/generated_feedback_alignment_failed_rows"] = alignment_failed_rows
+
+        if alignment_failed_rows:
+            logger.warning(
+                "Could not align feedback spans in %s/%s rows; retaining their original PPO masks",
+                alignment_failed_rows,
+                feedback_rows,
+            )
 
         return action_mask
 

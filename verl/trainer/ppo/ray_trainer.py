@@ -1784,6 +1784,17 @@ class RayPPOTrainer:
         corruption = numeric_values("corruption_flag")
         if corruption:
             metrics["lean/corruption_rate"] = float(np.mean(corruption))
+        # The loose anywhere-detector (>= 30 mixed-script chars in the whole response)
+        # and the charge it drives. In all three collapses this series ignited 1-2 steps
+        # before the tail-window corruption_rate; once LEAN_GIBBERISH_PENALTY is nonzero
+        # it is also a PRICED behavior, so read it as pressure applied, not as a neutral
+        # alarm -- entropy is the canary that cannot be trained against.
+        gibberish = numeric_values("gibberish_flag")
+        if gibberish:
+            metrics["lean/gibberish_rate"] = float(np.mean(gibberish))
+        gibberish_charge = numeric_values("lean_gibberish_penalty")
+        if gibberish_charge:
+            metrics["lean/gibberish_penalty_mean"] = float(np.mean(gibberish_charge))
 
         # Self-repair rate: the fraction of rollouts that completed a SECOND attempt.
         # Logged live because it is the earliest and sharpest collapse signal we have. In

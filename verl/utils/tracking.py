@@ -245,7 +245,14 @@ class FileLogger:
             os.makedirs(directory, exist_ok=True)
             self.filepath = os.path.join(directory, f"{self.experiment_name}.jsonl")
             print(f"Creating file logger at {self.filepath}")
-        self.fp = open(self.filepath, "wb", buffering=0)
+        # Append, never truncate: this pipeline resumes constantly (RunAI preemptions,
+        # pod-index restarts), and "wb" here would silently erase every step logged
+        # before the restart -- the exact history the file exists to preserve. Readers
+        # take the LAST record per step; a step re-logged across a resume boundary is
+        # duplicated, not lost. buffering=0 so a step line is on NFS the moment it is
+        # logged -- this file is the cross-node, lag-free metrics channel that W&B sync
+        # delays and the 4KB console-capture truncation cannot provide.
+        self.fp = open(self.filepath, "ab", buffering=0)
 
     def log(self, data, step):
         data = {"step": step, "data": data}

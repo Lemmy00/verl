@@ -4283,28 +4283,30 @@ class RayPPOTrainer:
         # load from hdfs
         if self.config.trainer.default_hdfs_dir is not None:
             raise NotImplementedError("load from hdfs is not implemented yet")
-        else:
+
+        if self.config.trainer.resume_mode == "auto":
             checkpoint_folder = self.config.trainer.default_local_dir  # TODO: check path
             if not os.path.isabs(checkpoint_folder):
                 working_dir = os.getcwd()
                 checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
             global_step_folder = find_latest_ckpt_path(checkpoint_folder)  # None if no latest
-
-        # find global_step_folder
-        if self.config.trainer.resume_mode == "auto":
             if global_step_folder is None:
                 print("Training from scratch")
                 return 0
+        elif self.config.trainer.resume_mode == "resume_path":
+            # The launcher may have recovered a complete checkpoint while the latest
+            # marker was missing, stale, or interrupted mid-write. An explicit path
+            # must not read that marker first: int("") would abort a valid recovery.
+            assert isinstance(self.config.trainer.resume_from_path, str), "resume ckpt must be str type"
+            assert "global_step_" in self.config.trainer.resume_from_path, (
+                "resume ckpt must specify the global_steps"
+            )
+            global_step_folder = self.config.trainer.resume_from_path
+            if not os.path.isabs(global_step_folder):
+                working_dir = os.getcwd()
+                global_step_folder = os.path.join(working_dir, global_step_folder)
         else:
-            if self.config.trainer.resume_mode == "resume_path":
-                assert isinstance(self.config.trainer.resume_from_path, str), "resume ckpt must be str type"
-                assert "global_step_" in self.config.trainer.resume_from_path, (
-                    "resume ckpt must specify the global_steps"
-                )
-                global_step_folder = self.config.trainer.resume_from_path
-                if not os.path.isabs(global_step_folder):
-                    working_dir = os.getcwd()
-                    global_step_folder = os.path.join(working_dir, global_step_folder)
+            raise ValueError(f"Unsupported checkpoint resume mode: {self.config.trainer.resume_mode}")
         print(f"Load from checkpoint folder: {global_step_folder}")
         # set global step
         self.global_steps = int(global_step_folder.split("global_step_")[-1])

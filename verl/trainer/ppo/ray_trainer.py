@@ -653,9 +653,9 @@ _MASK_DECL_NAME_RE = re.compile(r"\s+([A-Za-z_«][^\s(:{\[⦃⟨]*)")
 #     what their `in` chain applies to: a declaration/command continuation is a
 #     command chain (boundary at the chain start); a tactic or unknown continuation
 #     is a tactic (no boundary). Without an `in` clause they are plain commands.
-# Unknown commands still simply fail to end the body (pragmatic, not exhaustive);
-# the full-comment-coverage rule below still refuses to mask anything that is not
-# wholly comment.
+# Hash-prefixed commands also end the body, including unknown #commands. This is
+# a conservative lexical locator, not a complete Lean parser; the full-comment-
+# coverage rule below additionally refuses to mask executable text.
 _BOUNDARY_TOKEN_RE = re.compile(r"[A-Za-z_][\w.'!?]*")
 _BOUNDARY_DECL_WORDS = frozenset((
     "theorem", "lemma", "example", "def", "instance", "abbrev", "structure",
@@ -671,9 +671,43 @@ _BOUNDARY_COMMAND_WORDS = frozenset((
 _BOUNDARY_CHAIN_WORDS = frozenset(("set_option", "open"))
 
 
+def _chain_in_end(syntax: str, start: int) -> int | None:
+    """Find a chain's `in` across whitespace without borrowing a later command's.
+
+    Lean permits line breaks within command arguments and before `in`. Comments
+    and strings are already blanked. Stop at a new command/declaration prefix or
+    assignment instead of searching into a subsequent proof for an unrelated `in`.
+    """
+    pos = start
+    while pos < len(syntax):
+        line_end = syntax.find("\n", pos)
+        if line_end < 0:
+            line_end = len(syntax)
+        line = syntax[pos:line_end]
+        if pos != start:
+            prefix = line.lstrip(" \t\r")
+            head = _BOUNDARY_TOKEN_RE.match(prefix)
+            # `scoped` can be an argument of `open`, including on its own line.
+            new_unit_words = (
+                _BOUNDARY_DECL_WORDS | _BOUNDARY_COMMAND_WORDS | _BOUNDARY_CHAIN_WORDS
+                | (_BOUNDARY_MODIFIER_WORDS - {"scoped"})
+            )
+            if prefix.startswith(("@[", "#")) or (head and head.group(0) in new_unit_words):
+                return None
+        for token in _BOUNDARY_TOKEN_RE.finditer(syntax, pos, line_end):
+            if token.group(0) == "in":
+                return token.end()
+            if syntax[token.end():line_end].lstrip().startswith((":=", "=>")):
+                return None
+        pos = line_end + 1
+    return None
+
+
 def _starts_top_level_unit(syntax: str, p: int, depth: int = 0) -> bool:
     """Does a new top-level declaration/command start at p (first token of a line)?"""
     while True:
+        if syntax.startswith("#", p):
+            return True
         if syntax.startswith("@[", p):
             q, d = p + 2, 1
             while q < len(syntax) and d:
@@ -696,25 +730,22 @@ def _starts_top_level_unit(syntax: str, p: int, depth: int = 0) -> bool:
         word = tok_m.group(0)
         if word in _BOUNDARY_MODIFIER_WORDS:
             p = tok_m.end()
-            while p < len(syntax) and syntax[p] in " \t":
+            while p < len(syntax) and syntax[p] in " \t\r\n":
                 p += 1
             continue
         if word in _BOUNDARY_DECL_WORDS or word in _BOUNDARY_COMMAND_WORDS:
             return True
-        if word in _BOUNDARY_CHAIN_WORDS and depth < 4:
-            line_end = syntax.find("\n", tok_m.end())
-            if line_end < 0:
-                line_end = len(syntax)
-            for t in _BOUNDARY_TOKEN_RE.finditer(syntax, tok_m.end(), line_end):
-                if t.group(0) == "in":
-                    q = t.end()
-                    while q < len(syntax) and syntax[q] in " \t\r\n":
-                        q += 1
-                    if q >= len(syntax):
-                        return False
-                    return _starts_top_level_unit(syntax, q, depth + 1)
-            # No `in` clause on the line: a standalone command, not a tactic.
-            return True
+        if word in _BOUNDARY_CHAIN_WORDS:
+            if depth >= 4:
+                return True  # Uncertain ownership: retain PG beyond this prefix.
+            q = _chain_in_end(syntax, tok_m.end())
+            if q is None:
+                return True  # No `in` clause: a standalone command.
+            while q < len(syntax) and syntax[q] in " \t\r\n":
+                q += 1
+            if q >= len(syntax):
+                return True  # Incomplete chain: retain PG on uncertain content.
+            return _starts_top_level_unit(syntax, q, depth + 1)
         return False
 
 

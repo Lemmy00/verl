@@ -592,3 +592,68 @@ def test_standalone_set_option_command_is_a_boundary(tokenizer):
     )
     result, raw = _boundary_mask(tokenizer, raw)
     assert not _span_masked(result, raw, FB_BLOCK.rstrip(b"\n"))
+
+
+@pytest.mark.parametrize("prefix", [b"private\n", b"noncomputable\r\n", b"@[simp]\nprivate\n"])
+def test_multiline_modifier_starts_the_next_declaration(tokenizer, prefix):
+    """Compiled round-four cases: the comment is after helper's modifier, not in target."""
+    raw = (
+        b"```lean4\ntheorem target : True := by\n  trivial\n"
+        + prefix + FB_BLOCK + b"def helper : Nat := 0\n```"
+    )
+    result, raw = _boundary_mask(tokenizer, raw)
+    assert result == [1] * len(raw)
+
+
+@pytest.mark.parametrize("header", [
+    b"set_option maxRecDepth 1000\n  in",
+    b"open Nat\n  in",
+    b"set_option\n    maxRecDepth\n    1000\n  in",
+    b"open\n    Nat\n  in",
+    b"open Nat\n  /- a comment between the arguments and in -/\n  in",
+])
+def test_multiline_in_tactic_keeps_terminal_feedback_masked(tokenizer, header):
+    raw = (
+        b"```lean4\ntheorem target : True := by\n  " + header
+        + b"\n    trivial\n" + FB_BLOCK + b"```"
+    )
+    result, raw = _boundary_mask(tokenizer, raw)
+    assert _span_masked(result, raw, FB_BLOCK.rstrip(b"\n"))
+
+
+@pytest.mark.parametrize("header", [b"set_option maxRecDepth 1000", b"open Nat"])
+def test_multiline_in_command_chain_ends_target_body(tokenizer, header):
+    raw = (
+        b"```lean4\ntheorem target : True := by\n  trivial\n" + header
+        + b"\nin\n" + FB_BLOCK + b"def helper : Nat := 0\n```"
+    )
+    result, raw = _boundary_mask(tokenizer, raw)
+    assert result == [1] * len(raw)
+
+
+@pytest.mark.parametrize("command", [b"#check", b"#eval"])
+def test_hash_command_feedback_does_not_belong_to_target(tokenizer, command):
+    raw = (
+        b"```lean4\ntheorem target : True := by\n  trivial\n" + command
+        + b"\n" + FB_BLOCK + b"(0 : Nat)\n```"
+    )
+    result, raw = _boundary_mask(tokenizer, raw)
+    assert result == [1] * len(raw)
+
+
+def test_standalone_open_does_not_borrow_in_from_a_later_proof(tokenizer):
+    raw = (
+        b"```lean4\ntheorem target : True := by\n  trivial\nopen Nat\n"
+        + FB_BLOCK + b"example : True := by\n  set_option maxRecDepth 1000 in\n    trivial\n```"
+    )
+    result, raw = _boundary_mask(tokenizer, raw)
+    assert result == [1] * len(raw)
+
+
+def test_incomplete_command_chain_retains_pg(tokenizer):
+    raw = (
+        b"```lean4\ntheorem target : True := by\n  trivial\n"
+        b"set_option maxRecDepth 1000\nin\n" + FB_BLOCK
+    )
+    result, raw = _boundary_mask(tokenizer, raw)
+    assert result == [1] * len(raw)

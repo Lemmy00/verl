@@ -503,6 +503,21 @@ class AgentLoopWorker:
             sampling_params["top_p"] = config.val_kwargs.top_p
             sampling_params["top_k"] = config.val_kwargs.top_k
             sampling_params["temperature"] = config.val_kwargs.temperature
+        # Honor do_sample. This flag was dead code on the async path for the entire
+        # 2026-09 diagnosis window: val_kwargs.do_sample=false was recorded in configs
+        # while temp-0.3/top_p-0.95 sampling actually ran, and REMAX baselines
+        # (ray_trainer sets meta_info do_sample=False) silently sampled too. vLLM's
+        # SamplingParams has no do_sample field, so the only faithful translation is
+        # greedy parameters. Keyed on meta_info first (per-batch intent: REMAX,
+        # validation) falling back to val_kwargs for validation batches.
+        do_sample = batch.meta_info.get(
+            "do_sample",
+            config.val_kwargs.do_sample if batch.meta_info.get("validate", False) else True,
+        )
+        if not do_sample:
+            sampling_params["temperature"] = 0.0
+            sampling_params["top_p"] = 1.0
+            sampling_params["top_k"] = -1
 
         # by default, we assume it's a single turn agent
         if "agent_name" not in batch.non_tensor_batch:

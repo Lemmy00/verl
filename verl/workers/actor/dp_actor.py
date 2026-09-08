@@ -17,9 +17,12 @@
 Single Process Actor
 """
 
+import json
 import logging
 import os
 import random
+import time
+import uuid
 from typing import Optional
 
 import torch
@@ -46,6 +49,102 @@ __all__ = ["DataParallelPPOActor"]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _local_gradient(gradient: torch.Tensor) -> torch.Tensor:
+    """Return the local tensor backing an ordinary or DTensor gradient."""
+    return gradient.to_local() if isinstance(gradient, DTensor) else gradient
+
+
+def _capture_gradient_probe(parameters, max_samples: int, offset: int = 0):
+    """Sample accumulated gradients without copying the full model gradient.
+
+    The returned samples represent the gradient from every objective accumulated before
+    SFT replay.  Sampling the same coordinates after replay lets us recover the replay-only
+    delta, including its norm and alignment with the other objectives.
+    """
+    if max_samples <= 0:
+        return None
+    gradients = []
+    total_elements = 0
+    for parameter in parameters:
+        if parameter.grad is None:
+            continue
+        gradient = _local_gradient(parameter.grad.detach()).reshape(-1)
+        if gradient.numel() == 0:
+            continue
+        gradients.append((parameter, gradient.numel()))
+        total_elements += gradient.numel()
+    if total_elements == 0:
+        return None
+
+    # ceil(total / max_samples) keeps the probe at or below its configured memory budget.
+    stride = max((total_elements + max_samples - 1) // max_samples, 1)
+    sample_offset = int(offset) % stride
+    cursor = 0
+    entries = []
+    for parameter, numel in gradients:
+        first = (sample_offset - cursor) % stride
+        if first < numel:
+            gradient = _local_gradient(parameter.grad.detach()).reshape(-1)
+            entries.append((parameter, first, gradient[first::stride].float().clone()))
+        cursor += numel
+    if not entries:
+        return None
+    return {"entries": entries, "stride": stride, "total_elements": total_elements}
+
+
+@torch.no_grad()
+def _finish_gradient_probe(probe, gradient_scale: float = 1.0) -> dict[str, float]:
+    """Estimate non-replay, replay-only, and combined gradient geometry."""
+    if probe is None:
+        return {}
+    entries = probe["entries"]
+    device = entries[0][2].device
+    # non-replay squared norm, replay squared norm, combined squared norm, dot product,
+    # sampled coordinates, and represented coordinates.
+    totals = torch.zeros(6, dtype=torch.float64, device=device)
+    stride = probe["stride"]
+    for parameter, first, before in entries:
+        if parameter.grad is None:
+            combined = torch.zeros_like(before)
+        else:
+            combined = _local_gradient(parameter.grad.detach()).reshape(-1)[first::stride].float()
+        if combined.numel() != before.numel():
+            raise RuntimeError("Actor gradient layout changed during the SFT replay backward pass")
+        replay = combined - before
+        before64, replay64, combined64 = before.double(), replay.double(), combined.double()
+        totals[0] += before64.square().sum()
+        totals[1] += replay64.square().sum()
+        totals[2] += combined64.square().sum()
+        totals[3] += (before64 * replay64).sum()
+        totals[4] += before.numel()
+    totals[5] = probe["total_elements"]
+    if torch.distributed.is_initialized():
+        torch.distributed.all_reduce(totals, op=torch.distributed.ReduceOp.SUM)
+
+    sampled = float(totals[4].item())
+    represented = float(totals[5].item())
+    if sampled <= 0.0 or represented <= 0.0:
+        return {}
+    element_weight = represented / sampled
+    scale = max(float(gradient_scale), 1.0)
+    non_replay_sq = max(float(totals[0].item()) * element_weight, 0.0) / (scale * scale)
+    replay_sq = max(float(totals[1].item()) * element_weight, 0.0) / (scale * scale)
+    combined_sq = max(float(totals[2].item()) * element_weight, 0.0) / (scale * scale)
+    dot = float(totals[3].item()) * element_weight / (scale * scale)
+    non_replay_norm = non_replay_sq**0.5
+    replay_norm = replay_sq**0.5
+    combined_norm = combined_sq**0.5
+    denom = non_replay_norm * replay_norm
+    return {
+        "actor/non_replay_grad_norm_est": non_replay_norm,
+        "actor/sft_replay_grad_norm_est": replay_norm,
+        "actor/combined_grad_norm_est": combined_norm,
+        "actor/sft_replay_to_non_replay_grad_ratio": replay_norm / max(non_replay_norm, 1e-30),
+        "actor/sft_replay_grad_cosine": dot / denom if denom > 0.0 else 0.0,
+        "actor/sft_replay_grad_probe_fraction": sampled / represented,
+    }
 
 
 class DataParallelPPOActor(BasePPOActor):
@@ -498,6 +597,50 @@ class DataParallelPPOActor(BasePPOActor):
                     outputs["topk_indices"] = topk_indices
             return outputs
 
+    def _record_update(self, record: dict) -> None:
+        """Append one JSON line per Adam update to $ACTOR_UPDATE_RECORD_PATH.rank{R}.
+
+        The 2026-09-08 round-2 review showed the chart pipeline cannot preserve
+        identifiable Adam-update records: reduce_metrics collapses the per-update
+        lists to step means, and zero-eligible updates omit keys, so list indices are
+        not update IDs. This recorder is the durable per-update channel: per-rank
+        files (concurrent writers never share a file), append-mode, one line per
+        optimizer step with explicit IDs. Disabled unless the env var is set.
+        """
+        path = self._resolve_update_record_path()
+        if path is False:
+            return
+        try:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, sort_keys=True) + "\n")
+        except OSError as exc:
+            # Diagnostics must never kill a training step; warn once per incident type.
+            logger.warning("ACTOR_UPDATE_RECORD_PATH write failed: %s: %s", type(exc).__name__, exc)
+
+    def _resolve_update_record_path(self):
+        """Per-rank record path from ACTOR_UPDATE_RECORD_PATH, or False when disabled.
+
+        Callers must gate record CONSTRUCTION on this: the record dict reads live
+        optimizer state (param_groups), which stub optimizers in the actor test
+        harnesses do not have -- and building a dict nobody writes is waste anyway.
+        """
+        path = getattr(self, "_update_record_path", None)
+        if path is None:
+            base = os.environ.get("ACTOR_UPDATE_RECORD_PATH", "").strip()
+            if base:
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                path = f"{base}.rank{rank}"
+                os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+                # Round-3 qualification: update_index/update_policy_call are actor-
+                # local and restart from 1 after recreation. actor_session (fresh per
+                # actor lifetime) plus the restored Adam step in each record make
+                # restarts and replay-on/off forks distinguishable in the files.
+                self._update_record_session = uuid.uuid4().hex[:12]
+            else:
+                path = False
+            self._update_record_path = path
+        return path
+
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
         if self.scaler is not None:
@@ -561,8 +704,20 @@ class DataParallelPPOActor(BasePPOActor):
                 f"{type(exc).__name__}: {exc}"
             ) from exc
         n_repair = int(df["proof_repair"].sum()) if "proof_repair" in df.columns else -1
+
+        def _row_dict(row):
+            d = {"input_ids": list(row.input_ids), "prompt_len": int(row.prompt_len)}
+            # Keep the class label with the row: the 2026-09-08 round-2 review caught
+            # this loader dropping proof_repair, which silently turned every class-split
+            # metric into "oneshot". Null/absent stays absent -> class "unknown", never
+            # mislabeled one-shot.
+            flag = getattr(row, "proof_repair", None)
+            if flag is not None and not pd.isna(flag):
+                d["proof_repair"] = bool(flag)
+            return d
+
         self._sft_replay_pool = [
-            {"input_ids": list(row.input_ids), "prompt_len": int(row.prompt_len)}
+            _row_dict(row)
             for row in df.itertuples()
             # 1 <= prompt_len < len. The upper bound: a prompt covering the whole sequence
             # has no CE target and would contribute 0/0. The LOWER bound is subtler --
@@ -655,7 +810,22 @@ class DataParallelPPOActor(BasePPOActor):
         total_target_tokens = sum(len(r["input_ids"]) - r["prompt_len"] for r in picks)
         if total_target_tokens <= 0:
             return {}
+        # Update-wide token denominator across DP workers (2026-09-08 contract; before
+        # this, each rank divided by ITS token count and FSDP's mean made the objective a
+        # mean-of-per-rank-means, weighting ranks unequally when the v2 pool's long rows
+        # land unevenly). Per-rank loss carries world * ce_sum / global_tokens so the
+        # FSDP mean reduction yields the exact global token mean.
+        if torch.distributed.is_initialized():
+            replay_world = torch.distributed.get_world_size()
+            _tok = torch.tensor([float(total_target_tokens)], dtype=torch.float64, device=device)
+            torch.distributed.all_reduce(_tok, op=torch.distributed.ReduceOp.SUM)
+            global_target_tokens = float(_tok.item())
+        else:
+            replay_world = 1
+            global_target_tokens = float(total_target_tokens)
         total_ce, total_tok = 0.0, 0
+        class_ce = {"repair": 0.0, "oneshot": 0.0, "unknown": 0.0, "long": 0.0, "short": 0.0}
+        class_tok = {"repair": 0, "oneshot": 0, "unknown": 0, "long": 0, "short": 0}
 
         for start in range(0, n, mb):
             chunk = picks[start : start + mb]
@@ -705,7 +875,7 @@ class DataParallelPPOActor(BasePPOActor):
             n_tok = valid.sum()
             # Divided by the step's TOTAL target tokens, not this chunk's, so the chunks sum
             # to one token-weighted mean CE regardless of how they were split.
-            loss = lam * ce_sum / float(total_target_tokens)
+            loss = lam * ce_sum * replay_world / global_target_tokens
             if self.scaler is not None:
                 self.scaler.scale(loss).backward()
             else:
@@ -713,15 +883,64 @@ class DataParallelPPOActor(BasePPOActor):
 
             total_ce += ce_sum.detach().item()
             total_tok += int(n_tok.item())
+            # Per-row CE for the class splits below (repair vs one-shot, long vs
+            # short). The 2026-09-08 replay-gradient review showed the pool-mean CE
+            # cannot see a 5.9-nat transition flip; these splits (and the offline
+            # frozen-history probes) are the replacements -- diagnostics only, the
+            # loss above is untouched.
+            with torch.no_grad():
+                row_ce = -torch.where(valid, logp, torch.zeros_like(logp)).sum(dim=-1)
+                row_tok = valid.sum(dim=-1)
+                for row_offset, pick in enumerate(chunk):
+                    ce_v = float(row_ce[row_offset].item())
+                    tok_v = int(row_tok[row_offset].item())
+                    flag = pick.get("proof_repair")
+                    key_class = "unknown" if flag is None else ("repair" if flag else "oneshot")
+                    key_len = "long" if len(pick["input_ids"]) > 6144 else "short"
+                    class_ce[key_class] += ce_v
+                    class_tok[key_class] += tok_v
+                    class_ce[key_len] += ce_v
+                    class_tok[key_len] += tok_v
 
         if total_tok == 0:
             return {}
+        _class_names = ("repair", "oneshot", "unknown", "long", "short")
+        _sums = torch.tensor(
+            [total_ce]
+            + [class_ce[n] for n in _class_names]
+            + [float(class_tok[n]) for n in _class_names],
+            dtype=torch.float64,
+            device=device,
+        )
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(_sums, op=torch.distributed.ReduceOp.SUM)
+        global_ce_sum = float(_sums[0].item())
+        class_ce_global = {n: float(_sums[1 + i].item()) for i, n in enumerate(_class_names)}
+        class_tok_global = {n: float(_sums[6 + i].item()) for i, n in enumerate(_class_names)}
         mean_ce = total_ce / total_tok
         return {
             "actor/sft_replay_ce": mean_ce,
             "actor/sft_replay_loss": lam * mean_ce,
             "actor/sft_replay_tokens": float(total_tok),
             "actor/sft_replay_lambda": lam,
+            "actor/sft_replay_tokens_global": float(global_target_tokens),
+            # The OBJECTIVE's value: global token-mean CE, matching the loss's
+            # denominator. actor/sft_replay_ce above stays the per-rank token mean
+            # (a mean of these across ranks is NOT the objective when lengths differ).
+            "actor/sft_replay_ce_global": global_ce_sum / max(global_target_tokens, 1.0),
+            # Class splits: GLOBAL token means (class CE sums and token counts are
+            # all-reduced above -- averaging per-rank means would be sensitive to which
+            # workers draw the long rows). Globally empty classes omit their key; rows
+            # with no proof_repair metadata land in "unknown", never in "oneshot". The
+            # v2 pool halves the header token's share of the pool-mean (0.645% ->
+            # 0.345% of answer tokens), so an aggregate CE is even less able to
+            # surface transition damage than before -- read these, and the offline
+            # header probes, instead of the aggregate.
+            **{
+                f"actor/sft_replay_ce_{name}": class_ce_global[name] / class_tok_global[name]
+                for name in _class_names
+                if class_tok_global[name] > 0
+            },
         }
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
@@ -815,6 +1034,26 @@ class DataParallelPPOActor(BasePPOActor):
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         pad_token_id = data.meta_info.get("pad_token_id", 0)
+        # Per-update record IDs: (call, index-in-call) plus a monotone per-rank counter.
+        self._update_policy_calls = getattr(self, "_update_policy_calls", 0) + 1
+        _update_in_call = 0
+        # The 2026-09-08 normalization contract is derived for seq-mean-token-mean,
+        # where a microbatch aggregate is exactly the mean of per-row token-means over
+        # eligible rows. Under token-mean or sum-normalized modes the same scaling is
+        # NOT partition-invariant (verified by the phase-2 review); refuse rather than
+        # silently produce packing-dependent gradients. Likewise a caller-supplied
+        # global_batch_info would stack a second normalization on top of this one.
+        if self.config.loss_agg_mode != "seq-mean-token-mean":
+            raise NotImplementedError(
+                "update_policy's update-wide denominators support only "
+                f"loss_agg_mode='seq-mean-token-mean', got {self.config.loss_agg_mode!r}"
+            )
+        if self.config.get("global_batch_info", None):
+            raise ValueError(
+                "actor.global_batch_info must be empty: the 2026-09-08 update-wide "
+                "denominators already normalize globally, and agg_loss-level global "
+                "batch info would double-scale the objectives"
+            )
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
         self_distillation_enabled = loss_mode == "sdpo"
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
@@ -874,28 +1113,13 @@ class DataParallelPPOActor(BasePPOActor):
 
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
 
-        metrics = {
-            "actor/pg_loss": 0.0,
-            # actor/kl_loss is aggregated over the FULL response_mask, on every row that
-            # carries a policy gradient -- see the KL block in the micro-batch loop below.
-            # It used to use the narrowed ppo_response_mask, which left the masked tail with
-            # no pull back toward the reference policy at all; that unanchored tail is
-            # exactly where the 5.7e-03 -> 1.4e-01 drift lived. Rows with a fully zeroed
-            # ppo_response_mask (the auxiliary CE rows, which have no real ref_log_prob) are
-            # excluded, as they always were.
-            "actor/kl_loss": 0.0,
-            # Kept so the drift detector's series stays continuous across the mask switch,
-            # but it is NOT an independent measurement any more: the loss KL and this
-            # diagnostic now coincide by construction, because both aggregate over the full
-            # response of the same rows. It is copied from kl_loss rather than recomputed,
-            # so the two can never silently disagree.
-            "actor/kl_loss_full_response": 0.0,
-            # The complementary half, and the only genuinely distinct KL number left: the
-            # same kld restricted to the narrowed ppo_response_mask, i.e. the tokens that
-            # still get a policy gradient. actor/kl_loss minus this is the tail's share.
-            # Diagnostic only -- it never enters the loss.
-            "actor/kl_loss_ppo_mask": 0.0,
-        }
+        # Objective metrics are appended once PER ADAM UPDATE as global means (the
+        # numerators and denominators are all-reduced with matching weights); the
+        # logged training step then averages its updates via reduce_metrics, which is
+        # a labeled mean-over-updates, not a sum. The 2026-09-08 phase-2 review found
+        # the previous scheme reported unweighted per-worker means (an empty worker
+        # dragged the average toward zero) and summed the two Adam updates together.
+        metrics = {}
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
@@ -910,7 +1134,73 @@ class DataParallelPPOActor(BasePPOActor):
                     # leaving the short tail step scaled by the wrong factor.
                     self.gradient_accumulation = max(len(micro_batches), 1)
 
+                # ------------------------------------------------------------------
+                # Explicit per-objective denominators for THIS Adam update (2026-09-08
+                # normalization contract). The old scheme divided every objective by the
+                # microbatch count, which counts aux/padding microbatches that contribute
+                # nothing to a given objective: adding a zero-PG aux row in its own
+                # microbatch HALVED a rollout row's PG gradient (reproduced on the real
+                # backward), and PG/KL ran at ~0.51x effective strength for the entire
+                # 2026-09 collapse series while the separately-normalized replay CE was
+                # undiluted. Each objective now averages over ITS eligible rows across
+                # the whole update, all DP workers included: per-rank losses carry
+                # world_size * (local contribution) / N_global, so FSDP's mean gradient
+                # reduction yields exactly sum_global / N_global. Repartitioning across
+                # microbatches, appending inert rows, or uneven per-rank row counts can
+                # no longer change any objective's gradient.
+                # KL shares the PG row set by construction: kl_loss_mask.any(row) <=>
+                # ppo_response_mask.any(row), since the ppo mask is response_mask with
+                # zeros (subset), and the KL row gate keys on ppo_response_mask.any().
+                _mb = mini_batch.batch
+                _resp_mask = _mb["response_mask"]
+                _ppo_mask = (
+                    _mb["ppo_response_mask"] if "ppo_response_mask" in _mb.keys() else _resp_mask
+                ).to(bool)
+                _fb_w = _mb["feedback_loss_weights"] if "feedback_loss_weights" in _mb.keys() else None
+                if bool((_ppo_mask & ~_resp_mask.to(bool)).any()):
+                    raise AssertionError(
+                        "ppo_response_mask must be a subset of response_mask; the KL "
+                        "row-count sharing (and the KL row gate itself) rely on it"
+                    )
+                pg_rows_local = _ppo_mask.any(dim=-1).sum()
+                fb_rows_local = (
+                    (_fb_w.sum(dim=-1) > 0).sum() if _fb_w is not None else torch.zeros((), dtype=torch.long)
+                )
+                if torch.distributed.is_initialized():
+                    dp_world_size = torch.distributed.get_world_size()
+                    _counts = torch.tensor(
+                        [int(pg_rows_local.item()), int(fb_rows_local.item())],
+                        dtype=torch.float64,
+                        device=get_device_id(),
+                    )
+                    torch.distributed.all_reduce(_counts, op=torch.distributed.ReduceOp.SUM)
+                    pg_rows_global = float(_counts[0].item())
+                    fb_rows_global = float(_counts[1].item())
+                else:
+                    dp_world_size = 1
+                    pg_rows_global = float(pg_rows_local.item())
+                    fb_rows_global = float(fb_rows_local.item())
+                pg_rows_local_f = max(float(pg_rows_local.item()), 1.0)
+                fb_rows_local_f = max(float(fb_rows_local.item()), 1.0)
+                # Recorded every update: the coefficient conversation is only meaningful
+                # against these. rollout_row_fraction is the old dilution factor, kept as
+                # the audit trail of what this fix changed.
+                append_to_dict(metrics, {
+                    "actor/denom/pg_rows_global": pg_rows_global,
+                    "actor/denom/feedback_rows_global": fb_rows_global,
+                    "actor/denom/total_rows_global": float(_resp_mask.shape[0]) * dp_world_size,
+                    "actor/denom/rollout_row_fraction": (
+                        pg_rows_global / max(float(_resp_mask.shape[0]) * dp_world_size, 1.0)
+                    ),
+                })
+
                 self.actor_optimizer.zero_grad()
+                # Per-update objective numerators (local), reduced globally after the
+                # microbatch loop with the SAME row weights the gradients use.
+                pg_sum_local = 0.0
+                kl_sum_local = 0.0
+                kl_ppo_mask_sum_local = 0.0
+                fb_sum_local = 0.0
 
                 for micro_batch in micro_batches:
                     micro_batch = micro_batch.to(get_device_id())
@@ -931,10 +1221,6 @@ class DataParallelPPOActor(BasePPOActor):
                     if self_distillation_enabled:
                         assert not has_multi_modal_inputs, "Multi-modal inputs are not supported for SDPO distillation"
 
-                    if self.config.use_dynamic_bsz:
-                        loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
-                    else:
-                        loss_scale_factor = 1 / self.gradient_accumulation
 
                     return_all_logps = (
                         self_distillation_enabled
@@ -1060,7 +1346,16 @@ class DataParallelPPOActor(BasePPOActor):
                             )
                             micro_batch_metrics.update(rollout_corr_metrics)
 
-                    policy_loss = pg_loss
+                    # Objective scaling per the update-wide contract above. pg_loss is
+                    # agg_loss's mean over this microbatch's ELIGIBLE rows; x n_rows gives
+                    # their sum, x world/N_global completes the global row-mean once FSDP
+                    # averages gradients across ranks. Zero eligible rows anywhere keeps a
+                    # finite zero through the dummy-loss branches.
+                    pg_rows_micro = ppo_response_mask.any(dim=-1).sum().item()
+                    pg_update_scale = (
+                        float(pg_rows_micro) * dp_world_size / pg_rows_global if pg_rows_global > 0 else 0.0
+                    )
+                    policy_loss = pg_loss * pg_update_scale
                     if calculate_entropy and entropy is not None:
                         if ppo_response_mask.any():
                             entropy_agg = agg_loss(
@@ -1081,7 +1376,7 @@ class DataParallelPPOActor(BasePPOActor):
                                     loss_agg_mode=loss_agg_mode,
                                 ).detach().item()
                         if entropy_coeff != 0:
-                            policy_loss -= entropy_agg * entropy_coeff
+                            policy_loss -= entropy_agg * entropy_coeff * pg_update_scale
 
                     if self.config.use_kl_loss:
                         ref_log_prob = model_inputs["ref_log_prob"]
@@ -1147,16 +1442,21 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             kl_loss = log_prob.sum() * 0.0
 
-                        policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
-                        metrics["actor/kl_loss"] += kl_loss.detach().item() * loss_scale_factor
+                        # Same row set as PG (see the contract comment at the top of the
+                        # minibatch): kl_loss is agg_loss's mean over rows with any
+                        # kl_loss_mask token, scaled to the update-wide row mean.
+                        kl_rows_micro = kl_loss_mask.any(dim=-1).sum().item()
+                        kl_update_scale = (
+                            float(kl_rows_micro) * dp_world_size / pg_rows_global if pg_rows_global > 0 else 0.0
+                        )
+                        policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef * kl_update_scale
+                        kl_sum_local += kl_loss.detach().item() * float(kl_rows_micro)
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
-                        # actor/kl_loss is now itself the whole-response KL, so the
-                        # full-response diagnostic is the SAME NUMBER, not a second opinion.
-                        # The key is kept only so the drift detector's history survives the
-                        # switch, and it is assigned from kl_loss instead of being recomputed
-                        # so the pair can never disagree or read as two measurements.
-                        metrics["actor/kl_loss_full_response"] += kl_loss.detach().item() * loss_scale_factor
+                        # actor/kl_loss is now itself the whole-response KL. Its old
+                        # full-response continuity-copy key was retired in the 2026-09-08
+                        # metric cleanup: phase 2 is a fresh baseline, and two names for
+                        # one number read as two measurements.
 
                         # The genuinely new number: the same kld over the narrowed mask, i.e.
                         # the tokens that still receive a policy gradient. This is what
@@ -1169,12 +1469,14 @@ class DataParallelPPOActor(BasePPOActor):
                                     loss_mask=ppo_response_mask,
                                     loss_agg_mode=loss_agg_mode,
                                 )
-                                metrics["actor/kl_loss_ppo_mask"] += (
-                                    ppo_mask_kl.detach().item() * loss_scale_factor
+                                kl_ppo_mask_sum_local += ppo_mask_kl.detach().item() * float(
+                                    pg_rows_micro
                                 )
 
                     feedback_cfg = self.config.get("feedback_loss", None)
-                    feedback_enabled = bool(getattr(feedback_cfg, "enabled", False)) if feedback_cfg is not None else False
+                    feedback_enabled = (
+                        bool(getattr(feedback_cfg, "enabled", False)) if feedback_cfg is not None else False
+                    )
                     feedback_lambda = (
                         float(getattr(feedback_cfg, "lambda_coef", 1.0)) if feedback_cfg is not None else 1.0
                     )
@@ -1183,8 +1485,23 @@ class DataParallelPPOActor(BasePPOActor):
                         feedback_weights = feedback_weights.to(device=log_prob.device, dtype=log_prob.dtype)
                         ce = -log_prob
                         feedback_weight_sum = feedback_weights.sum()
-                        feedback_loss = (ce * feedback_weights).sum() / torch.clamp(feedback_weight_sum, min=1.0)
-                        policy_loss = policy_loss + feedback_lambda * feedback_loss
+                        # Per-ROW weighted mean, then the update-wide mean over rows with
+                        # targets (the 2026-09-08 contract). The previous microbatch-global
+                        # sum(w*ce)/sum(w) changed value with row packing; per-row means are
+                        # partition-invariant, and at micro_batch_size=1 (every run so far)
+                        # they are numerically identical to the old behavior before scaling.
+                        fb_row_wsum = feedback_weights.sum(dim=-1)
+                        fb_row_mask = fb_row_wsum > 0
+                        fb_rows_micro = int(fb_row_mask.sum().item())
+                        if fb_rows_micro > 0 and fb_rows_global > 0:
+                            fb_row_loss = (ce * feedback_weights).sum(dim=-1) / torch.clamp(fb_row_wsum, min=1e-8)
+                            feedback_loss = fb_row_loss[fb_row_mask].mean()
+                            fb_sum_local += fb_row_loss[fb_row_mask].sum().detach().item()
+                            policy_loss = policy_loss + feedback_lambda * fb_row_loss[fb_row_mask].sum() * (
+                                dp_world_size / fb_rows_global
+                            )
+                        else:
+                            feedback_loss = (ce * feedback_weights).sum() * 0.0
                         micro_batch_metrics["actor/feedback_lambda"] = feedback_lambda
                         # Only report CE from micro-batches that actually carry feedback
                         # tokens. Averaging in the zeros from ordinary rollout rows made the
@@ -1234,28 +1551,142 @@ class DataParallelPPOActor(BasePPOActor):
                                     theorem_weight_sum.detach().item()
                                 )
 
-                    if self.config.use_dynamic_bsz:
-                        # relative to the dynamic bsz
-                        loss = policy_loss * loss_scale_factor
-                    else:
-                        loss = policy_loss * loss_scale_factor
+                    # No loss_scale_factor here any more: every objective already carries
+                    # its explicit update-wide denominator (see the minibatch header). The
+                    # old division by microbatch count is exactly the confirmed aux/padding
+                    # dilution this fix removes, in both the static and dynamic-bsz branches.
+                    loss = policy_loss
                     if self.scaler is not None:
                         self.scaler.scale(loss).backward()
                     else:
                         loss.backward()
 
-                    metrics["actor/pg_loss"] += pg_loss.detach().item() * loss_scale_factor
+                    pg_sum_local += pg_loss.detach().item() * float(pg_rows_micro)
                     append_to_dict(metrics, micro_batch_metrics)
+
+                # Probe the already-accumulated non-replay gradient on a small, fixed set of
+                # coordinates. After replay backward, the change at those coordinates is the
+                # replay-only gradient. This is an estimate, but unlike comparing scalar loss
+                # values it directly measures gradient strength and alignment.
+                sft_cfg = self.config.get("sft_replay", None)
+                probe_samples = (
+                    int(getattr(sft_cfg, "grad_probe_samples", 0))
+                    if sft_cfg is not None and bool(getattr(sft_cfg, "enabled", False))
+                    else 0
+                )
+                # Zero probe samples must be a true no-op: walking parameters() here
+                # broke every stub-module test and costs a pointless traversal per
+                # update when the probe is off.
+                grad_probe = (
+                    _capture_gradient_probe(
+                        self.actor_module.parameters(), probe_samples, offset=self._sft_replay_seed
+                    )
+                    if probe_samples > 0
+                    else None
+                )
 
                 # Before the optimizer step, so replay gradients accumulate into this same
                 # step and are clipped by the same grad_clip rather than forming an
                 # unclipped second update.
+                # Per-update objective means, globally weighted (2026-09-08 P2 fix):
+                # numerators reduced with the same eligible-row weights the gradients
+                # carry, then divided by the ALREADY-reduced global counts. Appended
+                # once per Adam update; reduce_metrics' mean over the logged step is a
+                # labeled mean-over-updates. An empty worker contributes zero to the
+                # numerator AND zero to the denominator instead of dragging a
+                # per-worker average toward zero.
+                if torch.distributed.is_initialized():
+                    _sums = torch.tensor(
+                        [pg_sum_local, kl_sum_local, fb_sum_local],
+                        dtype=torch.float64,
+                        device=get_device_id(),
+                    )
+                    torch.distributed.all_reduce(_sums, op=torch.distributed.ReduceOp.SUM)
+                    pg_sum_global, kl_sum_global, fb_sum_global = (float(v) for v in _sums.tolist())
+                else:
+                    pg_sum_global, kl_sum_global, fb_sum_global = pg_sum_local, kl_sum_local, fb_sum_local
+                update_metrics = {}
+                if pg_rows_global > 0:
+                    update_metrics["actor/pg_loss"] = pg_sum_global / pg_rows_global
+                    update_metrics["actor/kl_loss"] = kl_sum_global / pg_rows_global
+                    # Diagnostic, deliberately LOCAL (per-rank narrowed-mask KL mean).
+                    update_metrics["actor/kl_loss_ppo_mask"] = (
+                        kl_ppo_mask_sum_local / pg_rows_local_f
+                    )
+                if fb_rows_global > 0:
+                    update_metrics["actor/feedback_ce_loss_update"] = fb_sum_global / fb_rows_global
+                append_to_dict(metrics, update_metrics)
+
                 sft_replay_metrics = self._sft_replay_step(pad_token_id)
                 if sft_replay_metrics:
                     append_to_dict(metrics, sft_replay_metrics)
+                if grad_probe is not None and sft_replay_metrics:
+                    gradient_scale = self.scaler.get_scale() if self.scaler is not None else 1.0
+                    append_to_dict(metrics, _finish_gradient_probe(grad_probe, gradient_scale))
 
                 grad_norm = self._optimizer_step()
-                mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
+                grad_norm_val = float(grad_norm.detach().item())
+                mini_batch_metrics = {"actor/grad_norm": grad_norm_val}
                 append_to_dict(metrics, mini_batch_metrics)
+
+                # Durable per-update record (see _record_update). Objective fields are
+                # None when the update had no eligible rows -- explicit absence, never a
+                # fabricated zero. grad_norm is the pre-clip total norm; clip_factor is
+                # what scaled the applied gradient. Constructed ONLY when recording is
+                # on: the dict reads optimizer state that stub harnesses do not stub.
+                if self._resolve_update_record_path() is not False:
+                    self._update_record_index = getattr(self, "_update_record_index", 0) + 1
+                    _update_in_call += 1
+                    _norm_finite = bool(torch.isfinite(grad_norm).item())
+                    if self.scaler is not None:
+                        _step_outcome = "scaler_managed"
+                    elif _norm_finite:
+                        _step_outcome = "applied"
+                    else:
+                        _step_outcome = "skipped_nonfinite"
+                    _opt_step_val = None
+                    try:
+                        for _st in self.actor_optimizer.state.values():
+                            _t = _st.get("step")
+                            if _t is not None:
+                                _opt_step_val = int(_t.item() if hasattr(_t, "item") else _t)
+                                break
+                    except (AttributeError, TypeError):
+                        pass
+                    self._record_update({
+                        "ts": time.time(),
+                        "actor_session": getattr(self, "_update_record_session", None),
+                        "optimizer_step": _opt_step_val,
+                        "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
+                        "world": dp_world_size,
+                        "global_steps": data.meta_info.get("global_steps", None),
+                        "update_policy_call": self._update_policy_calls,
+                        "update_in_call": _update_in_call,
+                        "update_index": self._update_record_index,
+                        "pg_rows_local": int(pg_rows_local.item()),
+                        "feedback_rows_local": int(fb_rows_local.item()),
+                        "total_rows_local": int(_resp_mask.shape[0]),
+                        "pg_rows_global": pg_rows_global,
+                        "feedback_rows_global": fb_rows_global,
+                        "total_rows_global": float(_resp_mask.shape[0]) * dp_world_size,
+                        "pg_loss": (pg_sum_global / pg_rows_global) if pg_rows_global > 0 else None,
+                        "kl_loss": (kl_sum_global / pg_rows_global) if pg_rows_global > 0 else None,
+                        "feedback_ce_loss": (fb_sum_global / fb_rows_global) if fb_rows_global > 0 else None,
+                        "sft_replay_ce_global": sft_replay_metrics.get("actor/sft_replay_ce_global")
+                        if sft_replay_metrics
+                        else None,
+                        "sft_replay_tokens_global": sft_replay_metrics.get("actor/sft_replay_tokens_global")
+                        if sft_replay_metrics
+                        else None,
+                        "lr": float(self.actor_optimizer.param_groups[0]["lr"]),
+                        "grad_norm": grad_norm_val,
+                        "grad_clip": float(self.config.grad_clip),
+                        "clip_factor": (
+                            min(1.0, float(self.config.grad_clip) / grad_norm_val)
+                            if _norm_finite and grad_norm_val > 0
+                            else None
+                        ),
+                        "step_outcome": _step_outcome,
+                    })
         self.actor_optimizer.zero_grad()
         return metrics

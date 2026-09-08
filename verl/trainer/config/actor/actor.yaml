@@ -106,6 +106,10 @@ sft_replay:
   # Offset per rank so ranks forward different sequences
   seed: 1234
 
+  # Sample this many local gradient coordinates to estimate the replay/non-replay gradient
+  # norm ratio and cosine. Zero disables the diagnostic; it never changes the loss.
+  grad_probe_samples: 0
+
 # Auxiliary CE loss over canonical Lean feedback blocks
 feedback_loss:
 

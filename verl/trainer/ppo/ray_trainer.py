@@ -610,6 +610,343 @@ def _span_overlaps(start: int, end: int, spans) -> bool:
     return any(start < int(span_end) and end > int(span_start) for span_start, span_end in spans or [])
 
 
+def _span_contained(start: int, end: int, spans) -> bool:
+    """Full containment, not overlap: a token straddling a span boundary carries action
+    content (fence, tactic, prose) alongside feedback bytes, and the 2026-09-08 review
+    rule is that such a token must never be silently removed from PG."""
+    return any(start >= int(span_start) and end <= int(span_end) for span_start, span_end in spans or [])
+
+
+# Config echoes ride in every reward extra_info row so the DUMP files are
+# self-describing; as validation metrics they are constant-by-construction series
+# (val-aux/<src>/lean_max_closed_blocks/mean@1 ...) that only clutter the chart
+# namespace -- 13 dead keys per data source in the 2026-09-08 audit. Filtered at
+# the metric boundary ONLY (see _val_metrics_update): dumps keep every key.
+_VAL_METRIC_CONFIG_ECHO_KEYS = frozenset((
+    "lean_construction_enabled", "lean_construction_penalty_coef",
+    "lean_gibberish_penalty_coef", "lean_give_up_exempt_only_if_not_eos",
+    "lean_excess_blocks_penalty_cap", "lean_give_up_penalty_coef",
+    "lean_max_closed_blocks", "lean_max_trailing_ws",
+    "lean_incremental_optimization", "lean_warm_primary_header",
+    "lean_feedback_fallback_on_timeout", "lean_parallel_elaboration",
+    "lean_executor_workers",
+))
+
+_MASK_FENCE_OPEN_RE = re.compile(r"```lean4\r?\n")
+_MASK_DECL_HEAD_RE = re.compile(r"\b(theorem|lemma|example)\b")
+_MASK_DECL_NAME_RE = re.compile(r"\s+([A-Za-z_«][^\s(:{\[⦃⟨]*)")
+
+# Body-ending boundaries are the starts of TOP-LEVEL units. The round-3 review showed
+# a bare line-start keyword regex cannot express this: it missed modifier-prefixed
+# (`private def`, `local instance`) and two-space-indented declarations -- six
+# feedback comments in LATER declarations stayed inside the requested theorem's mask
+# region -- while its one-space indentation allowance truncated a proof at a
+# `set_option ... in` TACTIC, losing a legitimate terminal annotation. The scanner
+# below is structural, run on the comment/string-blanked text at each line start:
+#   * attribute blocks (`@[...]`, multi-line ok) and declaration modifiers
+#     (private/protected/noncomputable/unsafe/partial/scoped/local) are consumed
+#     before the keyword test;
+#   * declaration keywords and hard commands count at ANY indentation -- none of
+#     them has a nested/tactic form in Lean 4, so an indented `def` in a namespace
+#     is still a new unit while an indented `induction` never matches;
+#   * the two tactic-capable command keywords (`set_option`/`open`) are judged by
+#     what their `in` chain applies to: a declaration/command continuation is a
+#     command chain (boundary at the chain start); a tactic or unknown continuation
+#     is a tactic (no boundary). Without an `in` clause they are plain commands.
+# Unknown commands still simply fail to end the body (pragmatic, not exhaustive);
+# the full-comment-coverage rule below still refuses to mask anything that is not
+# wholly comment.
+_BOUNDARY_TOKEN_RE = re.compile(r"[A-Za-z_][\w.'!?]*")
+_BOUNDARY_DECL_WORDS = frozenset((
+    "theorem", "lemma", "example", "def", "instance", "abbrev", "structure",
+    "inductive", "class", "axiom", "opaque", "mutual",
+))
+_BOUNDARY_MODIFIER_WORDS = frozenset((
+    "private", "protected", "noncomputable", "unsafe", "partial", "scoped", "local",
+))
+_BOUNDARY_COMMAND_WORDS = frozenset((
+    "end", "section", "namespace", "import", "attribute", "variable", "universe",
+    "deriving", "export",
+))
+_BOUNDARY_CHAIN_WORDS = frozenset(("set_option", "open"))
+
+
+def _starts_top_level_unit(syntax: str, p: int, depth: int = 0) -> bool:
+    """Does a new top-level declaration/command start at p (first token of a line)?"""
+    while True:
+        if syntax.startswith("@[", p):
+            q, d = p + 2, 1
+            while q < len(syntax) and d:
+                if syntax[q] == "[":
+                    d += 1
+                elif syntax[q] == "]":
+                    d -= 1
+                q += 1
+            if d:
+                # Unterminated attribute: eager boundary -- clipping the body EARLY
+                # retains PG on whatever follows, the safe direction for uncertainty.
+                return True
+            p = q
+            while p < len(syntax) and syntax[p] in " \t\r\n":
+                p += 1
+            continue
+        tok_m = _BOUNDARY_TOKEN_RE.match(syntax, p)
+        if tok_m is None:
+            return False
+        word = tok_m.group(0)
+        if word in _BOUNDARY_MODIFIER_WORDS:
+            p = tok_m.end()
+            while p < len(syntax) and syntax[p] in " \t":
+                p += 1
+            continue
+        if word in _BOUNDARY_DECL_WORDS or word in _BOUNDARY_COMMAND_WORDS:
+            return True
+        if word in _BOUNDARY_CHAIN_WORDS and depth < 4:
+            line_end = syntax.find("\n", tok_m.end())
+            if line_end < 0:
+                line_end = len(syntax)
+            for t in _BOUNDARY_TOKEN_RE.finditer(syntax, tok_m.end(), line_end):
+                if t.group(0) == "in":
+                    q = t.end()
+                    while q < len(syntax) and syntax[q] in " \t\r\n":
+                        q += 1
+                    if q >= len(syntax):
+                        return False
+                    return _starts_top_level_unit(syntax, q, depth + 1)
+            # No `in` clause on the line: a standalone command, not a tactic.
+            return True
+        return False
+
+
+def _top_level_boundaries(syntax: str) -> list[int]:
+    """Sorted line-start positions where a new top-level unit begins."""
+    out: list[int] = []
+    pos, n = 0, len(syntax)
+    while pos <= n:
+        line_end = syntax.find("\n", pos)
+        if line_end < 0:
+            line_end = n
+        p = pos
+        while p < line_end and syntax[p] in " \t":
+            p += 1
+        if p < line_end and _starts_top_level_unit(syntax, p):
+            out.append(pos)
+        if line_end >= n:
+            break
+        pos = line_end + 1
+    return out
+
+# The body locator reuses the reward repo's lexical helpers (comment/string scanning
+# with binder-default-aware outer-assignment search). ray_trainer runs with the
+# project's src on PYTHONPATH in every launcher; a bare verl deployment without it
+# falls back to NO masking (fail-open) plus a one-time warning -- the mask is a
+# fork-specific behavior and silently masking with a weaker locator is exactly the
+# defect class the 2026-09-08 review rejected (binder defaults, comment/string
+# payloads and helper declarations all defeated the regex version).
+try:
+    from training.grpo.lean_construction import _proof_assignment as _lean_proof_assignment
+    from training.grpo.lean_construction import _scan_lexical as _lean_scan_lexical
+except Exception:  # pragma: no cover - bare verl without the reward repo
+    _lean_proof_assignment = None
+    _lean_scan_lexical = None
+_WARNED_NO_LEXICAL = False
+
+
+def _blank_regions(text: str, regions) -> str:
+    out = list(text)
+    for start, end, _kind in regions:
+        for k in range(start, min(end, len(text))):
+            if out[k] not in ("\n", "\r"):
+                out[k] = " "
+    return "".join(out)
+
+
+def _comment_kind_at(regions, pos: int) -> str | None:
+    for start, end, kind in regions:
+        if start <= pos < end:
+            return kind
+    return None
+
+
+def _position_valid_feedback_spans(
+    text: str, spans, target_names=None
+) -> tuple[list, int, int]:
+    """Keep only feedback spans that are genuine comments WHOLLY inside the proof body
+    of an accepted declaration inside a ```lean4 fence.
+
+    Returns (valid_spans, position_rejected, ambiguous_rejected).
+
+    2026-09-08 rule, revised after the phase-2 review found two P1 defects in the
+    regex version:
+      * TERMINAL NEWLINE: the recognizer includes an annotation's trailing newline,
+        which for a terminal in-proof comment overlaps the newline before the closing
+        fence. Containment is therefore judged on the span's SEMANTIC end (trailing
+        whitespace stripped); the full original span is still what gets masked.
+        Without this, 194-219 rows per healthy step lost the mask on ordinary
+        terminal error comments -- the exact annotations the mask protects.
+      * LEXICAL truth: declaration heads and the outer ':=' are located on a copy
+        with comments/strings blanked (payload-blind), the outer assignment search
+        skips binder defaults by bracket depth, EACH declaration owns its own body
+        (a later declaration's statement is never part of an earlier body), and the
+        span itself must be comment-classed -- feedback-marker text inside a string
+        literal is code, not an annotation.
+      * TARGET IDENTITY (round-2 Q2): a trustworthy target is REQUIRED. Only bodies
+        of declarations named in target_names mask; anonymous `example` never masks.
+        With no target information this function masks NOTHING (returns [], 0, 0);
+        the caller counts such rows as identity_missing and leaves PG intact. There
+        is no any-named-declaration fallback -- a non-Lean caller must not acquire
+        Lean feedback masking accidentally.
+      * FULL COMMENT COVERAGE (round-2 P1): endpoint classification is not enough --
+        line-comment endpoints or two separate block comments can sandwich live
+        tactics that would then be hidden from PG. Every position of the semantic
+        span must lie inside a comment lexical region or be whitespace; otherwise
+        the span stays PG-eligible. Bare <feedback> tags in code position are code.
+      * BODY BOUNDARY (round-2 P1, rebuilt in round 3): the requested proof ends at
+        the next TOP-LEVEL unit start, found structurally rather than by bare
+        keywords -- attribute blocks and declaration modifiers (private/
+        noncomputable/local/...) are consumed first, declaration keywords count at
+        any indentation (none has a tactic form), and `set_option`/`open` are
+        boundaries only in command position (their `in`-chain continuation decides;
+        a `set_option ... in <tactic>` inside the proof does NOT end it). The outer
+        ':=' search is clipped to that candidate's own text.
+      * UNCLOSED FINAL FENCE: a COMPLETE comment inside an unfinished proof is still
+        a legitimate annotation (the budget ended the fence, not the model's intent)
+        and is maskable; anything the lexer cannot classify stays eligible.
+
+    position_rejected counts recognizer spans confidently OUTSIDE every accepted
+    body -- prose and statement-region feedback of any shape. It is BROADER than the
+    literal malformed `Here is /- <feedback>` header (step-70 audit: thousands of
+    rejected spans, one exact header string); read it as "feedback-shaped text
+    outside the requested proof", not as a malformed-header count. ambiguous_rejected
+    counts spans left eligible because the parse was uncertain; they are a different
+    diagnostic and must not be read as malformed headers.
+    """
+    global _WARNED_NO_LEXICAL
+    if not spans:
+        return [], 0, 0
+    if not target_names:
+        # Identity is a prerequisite (round-2 Q2): callers count and skip instead of
+        # reaching here; this is the safety net for direct calls.
+        return [], 0, 0
+    if _lean_scan_lexical is None or _lean_proof_assignment is None:
+        if not _WARNED_NO_LEXICAL:
+            logger.warning(
+                "lean_construction helpers unavailable; generated-feedback masking is "
+                "DISABLED (fail-open) -- add the reward repo's src to PYTHONPATH"
+            )
+            _WARNED_NO_LEXICAL = True
+        return [], 0, len(spans)
+
+    bodies: list[tuple[int, int]] = []  # absolute [start, end) proof-body intervals
+    lex_regions: list[tuple[int, int, str]] = []  # absolute, ALL lexical kinds
+    ambiguous_zones: list[tuple[int, int]] = []  # absolute regions with uncertain parse
+
+    pos = 0
+    while True:
+        m = _MASK_FENCE_OPEN_RE.search(text, pos)
+        if m is None:
+            break
+        nxt = _MASK_FENCE_OPEN_RE.search(text, m.end())
+        # A genuine close is "\n```" NOT immediately continuing into another opener:
+        # in a mis-nested response the next block's own backticks would otherwise be
+        # read as this block's close, silently turning an unclosed fence into a
+        # trusted body.
+        close, scan = -1, m.end()
+        while True:
+            cand = text.find("\n```", scan)
+            if cand < 0:
+                break
+            if text.startswith("```lean4", cand + 1):
+                scan = cand + 1
+                continue
+            close = cand
+            break
+        if close >= 0 and (nxt is None or close < nxt.start()):
+            body_lo, body_hi = m.end(), close
+            pos = close + 4
+        elif nxt is None:
+            # Unclosed FINAL fence: provisional body to end of text; complete
+            # comments inside remain maskable, the lexer decides completeness.
+            body_lo, body_hi = m.end(), len(text)
+            pos = len(text)
+        else:
+            # Mis-nested fence before another opener: nothing trustworthy here.
+            ambiguous_zones.append((m.end(), nxt.start()))
+            pos = nxt.start()
+            continue
+
+        fence_text = text[body_lo:body_hi]
+        regions, lex_error = _lean_scan_lexical(fence_text)
+        for r_start, r_end, kind in regions:
+            lex_regions.append((body_lo + r_start, body_lo + r_end, kind))
+        lex_limit = body_hi
+        if lex_error is not None:
+            scanned_to = regions[-1][1] if regions else 0
+            lex_limit = body_lo + scanned_to
+            ambiguous_zones.append((lex_limit, body_hi))
+        syntax = _blank_regions(fence_text, regions)
+
+        heads = list(_MASK_DECL_HEAD_RE.finditer(syntax))
+        boundaries = _top_level_boundaries(syntax)
+        for head in heads:
+            if body_lo + head.start() >= lex_limit:
+                continue
+            name_m = _MASK_DECL_NAME_RE.match(syntax, head.end())
+            name = name_m.group(1) if name_m and head.group(1) != "example" else None
+            # Identity is REQUIRED (round-2 Q2): no trustworthy target, no masking.
+            if name is None or name not in target_names:
+                continue
+            next_boundary = next((b for b in boundaries if b > head.start()), len(syntax))
+            # The outer-assignment search is bounded to THIS declaration: past the
+            # next top-level boundary a ':=' belongs to someone else.
+            assignment = _lean_proof_assignment(syntax[:next_boundary], head.end())
+            if assignment is None:
+                ambiguous_zones.append((body_lo + head.start(), min(lex_limit, body_hi)))
+                continue
+            by_m = re.match(r"\s*by\b", syntax[assignment + 2 :])
+            b_start = assignment + 2 + (by_m.end() if by_m else 0)
+            b_end = min(next_boundary, lex_limit - body_lo)
+            if b_start < b_end:
+                bodies.append((body_lo + b_start, body_lo + b_end))
+
+    valid: list = []
+    position_rejected = 0
+    ambiguous_rejected = 0
+    for s, e in spans:
+        sem_end = e
+        while sem_end > s and text[sem_end - 1] in " \t\r\n":
+            sem_end -= 1
+        in_body = any(s >= lo and sem_end <= hi for lo, hi in bodies)
+        # FULL-coverage annotation rule (round-2 P1): every non-whitespace character
+        # of the span must lie inside a COMMENT lexical region. Endpoint checks were
+        # defeated twice by compiling Lean -- a tactic sandwiched between '--' feedback
+        # lines, and two separate block comments whose recognizer span bridged live
+        # code. This rule also demotes bare '<feedback>' tags in executable-code
+        # position (they are not Lean comments; wrapping a tactic in tags must not
+        # strip its policy gradient), while a bare tag genuinely inside one comment
+        # still masks. Whitespace between comment lines is permitted.
+        is_annotation = True
+        pos_c = s
+        while pos_c < sem_end:
+            kind = _comment_kind_at(lex_regions, pos_c)
+            if kind in ("block_comment", "line_comment"):
+                # skip to the end of this comment region
+                pos_c = next(e for r_s, e, k in lex_regions if r_s <= pos_c < e)
+                continue
+            if text[pos_c] in " \t\r\n":
+                pos_c += 1
+                continue
+            is_annotation = False
+            break
+        if in_body and is_annotation:
+            valid.append((s, e))
+        elif any(lo <= s < hi for lo, hi in ambiguous_zones):
+            ambiguous_rejected += 1
+        else:
+            position_rejected += 1
+    return valid, position_rejected, ambiguous_rejected
+
+
 # Distinguishes "the byte table has not been built yet" from "it was built and is
 # unusable" (None). A plain sentinel string would be compared against a numpy array.
 _UNSET = object()
@@ -900,7 +1237,9 @@ def _feedback_token_indices_from_bytes(token_ids, text, spans, token_bytes) -> O
     starts = ends - np.asarray([len(piece) for piece in pieces], dtype=np.int64)
     masked = np.zeros(len(token_ids), dtype=bool)
     for start, end in byte_spans:
-        masked |= (starts < end) & (ends > start)
+        # Containment, not overlap: boundary-straddling tokens keep their PG (see
+        # _span_contained). A span's interior tokens are still fully covered.
+        masked |= (starts >= start) & (ends <= end)
     # Skipped special tokens have no text, even when placed inside a feedback span.
     masked &= ends > starts
     return np.flatnonzero(masked).tolist()
@@ -2663,7 +3002,15 @@ class RayPPOTrainer:
         action_mask = response_mask.clone()
         masked_tokens = 0
         feedback_rows = 0
+        outside_rows = 0
+        outside_spans = 0
+        ambiguous_rows = 0
+        ambiguous_spans = 0
+        identity_missing_rows = 0
         mismatch_rows = 0
+        targets_arr = batch.non_tensor_batch.get("theorem_statement_target", None)
+        if targets_arr is not None and len(targets_arr) != response_mask.shape[0]:
+            targets_arr = None  # aux-extended or mismatched batch: no identity filter
         byte_alignment_rows = 0
         alignment_failed_rows = 0
         special_ids = set(getattr(self.tokenizer, "all_special_ids", None) or [])
@@ -2681,6 +3028,38 @@ class RayPPOTrainer:
                 continue
 
             feedback_rows += 1
+            # Position rule (2026-09-08, revised after the phase-2 review): only
+            # comment-classed annotations wholly inside the REQUESTED declaration's
+            # proof body are masked. Prose/statement feedback is a wrong ACTION and
+            # keeps PG (position_rejected -- the malformed-header alarm); uncertain
+            # parses also stay eligible but are counted separately (ambiguous), so
+            # the alarm series is never polluted by lexer limitations.
+            target = None
+            if targets_arr is not None:
+                m_target = _MASK_DECL_HEAD_RE.search(str(targets_arr[row_idx] or ""))
+                if m_target is not None:
+                    name_m = _MASK_DECL_NAME_RE.match(str(targets_arr[row_idx]), m_target.end())
+                    if name_m is not None and m_target.group(1) != "example":
+                        target = {name_m.group(1)}
+            if target is None:
+                # No trustworthy requested-declaration identity: retain PG on the whole
+                # row and report the missing prerequisite (round-2 Q2). Every one of
+                # 4,096 inspected saved rows HAS a usable target and masking runs
+                # before aux rows are appended, so nonzero here means a data problem,
+                # not a normal condition -- and it must never read as malformed headers.
+                identity_missing_rows += 1
+                continue
+            spans, position_rejected, ambiguous_rejected = _position_valid_feedback_spans(
+                text, spans, target_names=target
+            )
+            if position_rejected:
+                outside_rows += 1
+                outside_spans += position_rejected
+            if ambiguous_rejected:
+                ambiguous_rows += 1
+                ambiguous_spans += ambiguous_rejected
+            if not spans:
+                continue
             # decode(skip_special_tokens=True) can omit tokens anywhere in the row.
             # Even a canonical re-encoding must map back through the original indices.
             visible_indices = [index for index, token_id in enumerate(token_ids) if token_id not in special_ids]
@@ -2700,7 +3079,7 @@ class RayPPOTrainer:
                     masked_indices = [
                         visible_indices[index]
                         for index, (start, end) in enumerate(offsets)
-                        if end > start and _span_overlaps(start, end, spans)
+                        if end > start and _span_contained(start, end, spans)
                     ]
             except Exception:
                 # Unsupported offset mappings can still use verified original bytes.
@@ -2733,6 +3112,18 @@ class RayPPOTrainer:
             metrics["feedback/generated_feedback_tokenizer_mismatch_rows"] = mismatch_rows
             metrics["feedback/generated_feedback_byte_alignment_rows"] = byte_alignment_rows
             metrics["feedback/generated_feedback_alignment_failed_rows"] = alignment_failed_rows
+            # Recognizer spans OUTSIDE the requested proof body: PG-eligible by
+            # design. Broader than the literal malformed header (the step-70 audit
+            # found thousands of rejected spans but ONE exact "Here is /- <feedback>"
+            # string) -- an early-warning series for feedback-shaped text leaking out
+            # of the proof, not a malformed-header count. 0 on healthy steps 60/65.
+            metrics["feedback/feedback_spans_outside_proof_rows"] = outside_rows
+            metrics["feedback/feedback_spans_outside_proof_count"] = float(outside_spans)
+            # Uncertain parses (lexer errors, unbalanced binders, mis-nested fences):
+            # eligible by fail-open, but NOT malformed headers. Keep the two apart.
+            metrics["feedback/feedback_spans_ambiguous_rows"] = ambiguous_rows
+            metrics["feedback/feedback_spans_ambiguous_count"] = float(ambiguous_spans)
+            metrics["feedback/feedback_mask_identity_missing_rows"] = identity_missing_rows
 
         if alignment_failed_rows:
             logger.warning(
@@ -3548,7 +3939,12 @@ class RayPPOTrainer:
         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
-        data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
+        measured = {
+            k: v
+            for k, v in reward_extra_infos_dict.items()
+            if k not in _VAL_METRIC_CONFIG_ECHO_KEYS
+        }
+        data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, measured)
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
             core_var = "acc" if "acc" in var2metric2val else "reward"
@@ -4116,6 +4512,10 @@ class RayPPOTrainer:
             actor_output["perf/mfu/actor"] = actor_output.pop("actor/mfu")
             actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
         else:
+            # Stamp the logged training step so the actor's per-update JSONL records
+            # (ACTOR_UPDATE_RECORD_PATH) can carry it; gen_batch gets the same stamp
+            # elsewhere but this batch never inherited it.
+            batch.meta_info["global_steps"] = self.global_steps
             actor_output = self.actor_rollout_wg.update_actor(batch)
 
         return actor_output

@@ -227,6 +227,9 @@ class SftReplayConfig(BaseConfig):
     samples_per_step: int = 128
     micro_batch_size: int = 2
     seed: int = 1234
+    # Number of local gradient coordinates sampled to estimate replay-vs-non-replay
+    # gradient norms and cosine. Zero disables the diagnostic. This does not change the loss.
+    grad_probe_samples: int = 0
 
     def __post_init__(self):
         if self.lambda_coef < 0.0:
@@ -241,6 +244,8 @@ class SftReplayConfig(BaseConfig):
             raise ValueError(
                 f"sft_replay.enabled=true requires samples_per_step >= 1, got {self.samples_per_step}"
             )
+        if self.grad_probe_samples < 0:
+            raise ValueError(f"sft_replay.grad_probe_samples must be non-negative, got {self.grad_probe_samples}")
         if self.enabled and not self.files:
             raise ValueError(
                 "sft_replay.enabled=true requires sft_replay.files. Silently training with no "

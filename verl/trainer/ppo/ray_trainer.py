@@ -3031,7 +3031,10 @@ class RayPPOTrainer:
 
         max_response_len = responses.shape[1]
         action_mask = response_mask.clone()
+        algorithm_cfg = getattr(self, "config", {}).get("algorithm", {})
+        mask_feedback = _truthy(algorithm_cfg.get("mask_generated_feedback", True))
         masked_tokens = 0
+        aligned_feedback_tokens = 0
         feedback_rows = 0
         outside_rows = 0
         outside_spans = 0
@@ -3131,12 +3134,19 @@ class RayPPOTrainer:
                 byte_alignment_rows += 1
 
             if masked_indices:
-                masked_tokens += len(masked_indices)
-                action_mask[row_idx, masked_indices] = 0
+                aligned_feedback_tokens += len(masked_indices)
+                if mask_feedback:
+                    masked_tokens += len(masked_indices)
+                    action_mask[row_idx, masked_indices] = 0
 
         if feedback_rows:
             denom = max(float(response_mask.sum().detach().item()), 1.0)
+            # Keep span diagnostics even when feedback participates in PG. This
+            # switch changes only the sampled-token PG mask; attention, reference
+            # KL, verified-feedback CE and replay are handled independently.
+            metrics["feedback/pg_mask_enabled"] = float(mask_feedback)
             metrics["feedback/generated_feedback_rows"] = feedback_rows
+            metrics["feedback/generated_feedback_aligned_tokens"] = float(aligned_feedback_tokens)
             metrics["feedback/generated_feedback_masked_tokens"] = float(masked_tokens)
             metrics["feedback/generated_feedback_masked_token_rate"] = float(masked_tokens) / denom
             # Counts exact ID/offset mismatches, including equal-length re-tokenizations.
@@ -4273,8 +4283,14 @@ class RayPPOTrainer:
         local_latest_checkpointed_iteration = os.path.join(
             self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
         )
-        with open(local_latest_checkpointed_iteration, "w") as f:
+        marker_temporary = local_latest_checkpointed_iteration + ".tmp"
+        with open(marker_temporary, "w") as f:
             f.write(str(self.global_steps))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(marker_temporary, local_latest_checkpointed_iteration)
+        from verl.trainer.ppo.recovery_checkpoint import after_checkpoint_save
+        after_checkpoint_save(self.config)
 
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":

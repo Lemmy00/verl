@@ -136,6 +136,9 @@ algorithm:
   # refunded, never the row's penalty total. Set False for pre-fix behaviour.
   neutralize_attempt_penalty_in_all_fail_groups: True
 
+  # Same opt-out as the FSDP schema; affects generated feedback's PG mask only.
+  mask_generated_feedback: True
+
   # Zero the PPO response mask after the last CLOSED ```lean4 block, keeping exactly ONE
   # token past it. The reward scores only that block, but GRPO broadcasts one scalar
   # advantage over every generated token, so a verified rollout reinforces whatever it

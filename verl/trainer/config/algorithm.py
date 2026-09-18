@@ -575,6 +575,8 @@ class AlgoConfig(BaseConfig):
         lam (float): Trade-off between bias and variance in the GAE estimator.
         adv_estimator (str): Advantage estimator type: "gae", "grpo", "reinforce_plus_plus", etc.
         norm_adv_by_std_in_grpo (bool): Whether to normalize advantages by std (specific to GRPO).
+        mask_generated_feedback (bool): Whether to exclude generated proof-feedback
+            annotations from PG. Does not change attention, feedback CE or replay.
         mask_after_last_lean_block (bool): Whether to zero the PPO response mask after the
             last closed ```lean4 block, so tokens the reward never read get no gradient.
         use_kl_in_reward (bool): Whether to enable in-reward KL penalty.
@@ -616,6 +618,9 @@ class AlgoConfig(BaseConfig):
     # correction applied after it cannot reproduce this. Defaults ON; set False for
     # byte-identical pre-fix behaviour. See core_algos.compute_grpo_outcome_advantage.
     neutralize_attempt_penalty_in_all_fail_groups: bool = True
+    # Preserve position-conditional feedback masking by default. False includes
+    # generated feedback tokens from every attempt in the rollout's PG objective.
+    mask_generated_feedback: bool = True
     # Zero the PPO response mask after the last CLOSED ```lean4 block, keeping exactly ONE
     # token past it. The reward only ever reads that block, yet GRPO broadcasts the scalar
     # advantage over every generated token, so a verified rollout reinforces its own

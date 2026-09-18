@@ -79,7 +79,7 @@ def byte_ids(tokenizer, raw):
     return [tokenizer.convert_tokens_to_ids(encoder[byte]) for byte in raw]
 
 
-def mask(tokenizer, ids, target="theorem t : True := by"):
+def mask(tokenizer, ids, target="theorem t : True := by", mask_feedback=None):
     # Identity is a masking PREREQUISITE (round-2 Q2): the helper defaults to the
     # fixtures' declaration so alignment tests exercise masking; pass target=None to
     # test the identity-missing path (PG retained, its own metric).
@@ -92,11 +92,64 @@ def mask(tokenizer, ids, target="theorem t : True := by"):
         batch.non_tensor_batch["theorem_statement_target"] = np.array([target], dtype=object)
     trainer = object.__new__(RayPPOTrainer)
     trainer.tokenizer = tokenizer
+    if mask_feedback is not None:
+        trainer.config = {"algorithm": {"mask_generated_feedback": mask_feedback}}
     metrics = {}
     result = trainer._proof_action_response_mask(batch, metrics)
     assert torch.equal(batch.batch["response_mask"], response_mask)
     assert result[0, len(ids) :].tolist() == [0, 0, 0]
     return result[0, : len(ids)].tolist(), metrics
+
+
+@pytest.mark.parametrize("enabled", [False, "false"])
+def test_unmasked_feedback_from_all_attempts_keeps_pg_and_diagnostics(tokenizer, enabled):
+    attempt = PREFIX + FEEDBACK + SUFFIX + CLOSE
+    raw = attempt + b"\nHere is the corrected proof:\n" + attempt
+    ids = byte_ids(tokenizer, raw) + [tokenizer.eos_token_id]
+    default_mask, baseline_metrics = mask(tokenizer, ids)
+    result, metrics = mask(tokenizer, ids, mask_feedback=enabled)
+    assert 0 in default_mask
+    assert result == [1] * len(ids)
+    assert metrics["feedback/pg_mask_enabled"] == 0
+    assert metrics["feedback/generated_feedback_masked_tokens"] == 0
+    assert metrics["feedback/generated_feedback_masked_token_rate"] == 0
+    assert metrics["feedback/generated_feedback_aligned_tokens"] == baseline_metrics[
+        "feedback/generated_feedback_masked_tokens"
+    ]
+    assert metrics["feedback/generated_feedback_rows"] == 1
+
+
+def test_explicit_feedback_masking_matches_existing_default(tokenizer):
+    ids = byte_ids(tokenizer, PREFIX + FEEDBACK + SUFFIX + CLOSE)
+    assert mask(tokenizer, ids, mask_feedback=True) == mask(tokenizer, ids)
+
+
+@pytest.mark.parametrize("advantage", [-1.0, 1.0])
+def test_unmasking_passes_both_signs_of_pg_to_feedback_tokens(tokenizer, advantage):
+    from omegaconf import OmegaConf
+    from verl.trainer.ppo.core_algos import compute_policy_loss_vanilla
+
+    ids = byte_ids(tokenizer, PREFIX + FEEDBACK + SUFFIX + CLOSE)
+    config = OmegaConf.create({"clip_ratio": 0.2, "clip_ratio_low": 0.2,
+                               "clip_ratio_high": 0.2, "global_batch_info": {}})
+    for enabled in (True, False):
+        kept, _ = mask(tokenizer, ids, mask_feedback=enabled)
+        response_mask = torch.tensor([kept + [0, 0, 0]])
+        log_probs = torch.zeros(response_mask.shape, requires_grad=True)
+        loss, _ = compute_policy_loss_vanilla(
+            old_log_prob=torch.zeros_like(log_probs), log_prob=log_probs,
+            advantages=torch.full_like(log_probs, advantage), response_mask=response_mask,
+            loss_agg_mode="seq-mean-token-mean", config=config,
+        )
+        loss.backward()
+        feedback_grad = log_probs.grad[0, len(PREFIX):len(PREFIX) + len(FEEDBACK)]
+        if enabled:
+            assert torch.count_nonzero(feedback_grad) == 0
+        else:
+            # Gradient descent lowers feedback-token probabilities for negative
+            # advantage and raises them for positive advantage.
+            assert torch.all(feedback_grad * advantage < 0)
+        assert torch.count_nonzero(log_probs.grad[0, -3:]) == 0
 
 
 def test_noncanonical_sampled_tokens_mask_feedback_and_preserve_proof(tokenizer):

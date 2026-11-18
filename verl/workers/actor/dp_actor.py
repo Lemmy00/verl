@@ -1064,6 +1064,8 @@ class DataParallelPPOActor(BasePPOActor):
                 "teacher_position_ids",
                 "self_distillation_mask",
             }
+            if self_distillation_cfg.get("distill_proof_only", False):
+                self_distillation_required_keys.add("self_distillation_response_mask")
             missing = self_distillation_required_keys - set(data.batch.keys())
             assert not missing, f"Missing required SDPO keys: {missing}"
 
@@ -1282,7 +1284,10 @@ class DataParallelPPOActor(BasePPOActor):
                         pg_loss, pg_metrics = compute_self_distillation_loss(
                             student_log_probs=log_prob,
                             teacher_log_probs=teacher_outputs["log_probs"],
-                            response_mask=ppo_response_mask,
+                            response_mask=(
+                                ppo_response_mask
+                                & model_inputs.get("self_distillation_response_mask", ppo_response_mask).to(bool)
+                            ),
                             self_distillation_config=self_distillation_cfg,
                             old_log_probs=old_log_prob,
                             student_all_log_probs=student_all_logps,

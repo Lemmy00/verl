@@ -127,6 +127,19 @@ class TaskRunner:
 
         use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
 
+        sdpo_cfg = config.actor_rollout_ref.actor.get("self_distillation", {})
+        upstream_sdpo = (
+            config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla") == "sdpo"
+            and sdpo_cfg.get("implementation", "local") == "upstream"
+        )
+        if upstream_sdpo:
+            if need_reference_policy(config):
+                raise ValueError("Upstream SDPO uses the reference slot for its EMA teacher; disable reference KL.")
+            if use_legacy_worker_impl == "disable":
+                raise ValueError("Upstream SDPO requires legacy FSDP workers to colocate the EMA teacher.")
+            if config.actor_rollout_ref.actor.strategy not in {"fsdp", "fsdp2"}:
+                raise ValueError("The pinned upstream SDPO adapter supports FSDP workers only.")
+
         # use new model engine implementation
         if use_legacy_worker_impl == "disable":
             from verl.workers.engine_workers import ActorRolloutRefWorker
@@ -168,8 +181,9 @@ class TaskRunner:
         else:
             raise NotImplementedError
 
-        self.role_worker_mapping[Role.ActorRollout] = ray.remote(actor_rollout_cls)
-        self.mapping[Role.ActorRollout] = "global_pool"
+        actor_role = Role.ActorRolloutRef if upstream_sdpo else Role.ActorRollout
+        self.role_worker_mapping[actor_role] = ray.remote(actor_rollout_cls)
+        self.mapping[actor_role] = "global_pool"
         return actor_rollout_cls, ray_worker_group_cls
 
     def add_critic_worker(self, config):

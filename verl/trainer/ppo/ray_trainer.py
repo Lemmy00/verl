@@ -799,75 +799,10 @@ def _comment_kind_at(regions, pos: int) -> str | None:
     return None
 
 
-def _position_valid_feedback_spans(
-    text: str, spans, target_names=None
-) -> tuple[list, int, int]:
-    """Keep only feedback spans that are genuine comments WHOLLY inside the proof body
-    of an accepted declaration inside a ```lean4 fence.
-
-    Returns (valid_spans, position_rejected, ambiguous_rejected).
-
-    2026-09-08 rule, revised after the phase-2 review found two P1 defects in the
-    regex version:
-      * TERMINAL NEWLINE: the recognizer includes an annotation's trailing newline,
-        which for a terminal in-proof comment overlaps the newline before the closing
-        fence. Containment is therefore judged on the span's SEMANTIC end (trailing
-        whitespace stripped); the full original span is still what gets masked.
-        Without this, 194-219 rows per healthy step lost the mask on ordinary
-        terminal error comments -- the exact annotations the mask protects.
-      * LEXICAL truth: declaration heads and the outer ':=' are located on a copy
-        with comments/strings blanked (payload-blind), the outer assignment search
-        skips binder defaults by bracket depth, EACH declaration owns its own body
-        (a later declaration's statement is never part of an earlier body), and the
-        span itself must be comment-classed -- feedback-marker text inside a string
-        literal is code, not an annotation.
-      * TARGET IDENTITY (round-2 Q2): a trustworthy target is REQUIRED. Only bodies
-        of declarations named in target_names mask; anonymous `example` never masks.
-        With no target information this function masks NOTHING (returns [], 0, 0);
-        the caller counts such rows as identity_missing and leaves PG intact. There
-        is no any-named-declaration fallback -- a non-Lean caller must not acquire
-        Lean feedback masking accidentally.
-      * FULL COMMENT COVERAGE (round-2 P1): endpoint classification is not enough --
-        line-comment endpoints or two separate block comments can sandwich live
-        tactics that would then be hidden from PG. Every position of the semantic
-        span must lie inside a comment lexical region or be whitespace; otherwise
-        the span stays PG-eligible. Bare <feedback> tags in code position are code.
-      * BODY BOUNDARY (round-2 P1, rebuilt in round 3): the requested proof ends at
-        the next TOP-LEVEL unit start, found structurally rather than by bare
-        keywords -- attribute blocks and declaration modifiers (private/
-        noncomputable/local/...) are consumed first, declaration keywords count at
-        any indentation (none has a tactic form), and `set_option`/`open` are
-        boundaries only in command position (their `in`-chain continuation decides;
-        a `set_option ... in <tactic>` inside the proof does NOT end it). The outer
-        ':=' search is clipped to that candidate's own text.
-      * UNCLOSED FINAL FENCE: a COMPLETE comment inside an unfinished proof is still
-        a legitimate annotation (the budget ended the fence, not the model's intent)
-        and is maskable; anything the lexer cannot classify stays eligible.
-
-    position_rejected counts recognizer spans confidently OUTSIDE every accepted
-    body -- prose and statement-region feedback of any shape. It is BROADER than the
-    literal malformed `Here is /- <feedback>` header (step-70 audit: thousands of
-    rejected spans, one exact header string); read it as "feedback-shaped text
-    outside the requested proof", not as a malformed-header count. ambiguous_rejected
-    counts spans left eligible because the parse was uncertain; they are a different
-    diagnostic and must not be read as malformed headers.
-    """
-    global _WARNED_NO_LEXICAL
-    if not spans:
-        return [], 0, 0
-    if not target_names:
-        # Identity is a prerequisite (round-2 Q2): callers count and skip instead of
-        # reaching here; this is the safety net for direct calls.
-        return [], 0, 0
-    if _lean_scan_lexical is None or _lean_proof_assignment is None:
-        if not _WARNED_NO_LEXICAL:
-            logger.warning(
-                "lean_construction helpers unavailable; generated-feedback masking is "
-                "DISABLED (fail-open) -- add the reward repo's src to PYTHONPATH"
-            )
-            _WARNED_NO_LEXICAL = True
-        return [], 0, len(spans)
-
+def _lean_proof_regions(text: str, target_names: set[str]):
+    """Locate requested proof bodies using the same lexer as feedback masking."""
+    if not target_names or _lean_scan_lexical is None or _lean_proof_assignment is None:
+        return [], [], []
     bodies: list[tuple[int, int]] = []  # absolute [start, end) proof-body intervals
     lex_regions: list[tuple[int, int, str]] = []  # absolute, ALL lexical kinds
     ambiguous_zones: list[tuple[int, int]] = []  # absolute regions with uncertain parse
@@ -939,6 +874,80 @@ def _position_valid_feedback_spans(
             b_end = min(next_boundary, lex_limit - body_lo)
             if b_start < b_end:
                 bodies.append((body_lo + b_start, body_lo + b_end))
+
+    return bodies, lex_regions, ambiguous_zones
+
+
+def _position_valid_feedback_spans(
+    text: str, spans, target_names=None
+) -> tuple[list, int, int]:
+    """Keep only feedback spans that are genuine comments WHOLLY inside the proof body
+    of an accepted declaration inside a ```lean4 fence.
+
+    Returns (valid_spans, position_rejected, ambiguous_rejected).
+
+    2026-09-08 rule, revised after the phase-2 review found two P1 defects in the
+    regex version:
+      * TERMINAL NEWLINE: the recognizer includes an annotation's trailing newline,
+        which for a terminal in-proof comment overlaps the newline before the closing
+        fence. Containment is therefore judged on the span's SEMANTIC end (trailing
+        whitespace stripped); the full original span is still what gets masked.
+        Without this, 194-219 rows per healthy step lost the mask on ordinary
+        terminal error comments -- the exact annotations the mask protects.
+      * LEXICAL truth: declaration heads and the outer ':=' are located on a copy
+        with comments/strings blanked (payload-blind), the outer assignment search
+        skips binder defaults by bracket depth, EACH declaration owns its own body
+        (a later declaration's statement is never part of an earlier body), and the
+        span itself must be comment-classed -- feedback-marker text inside a string
+        literal is code, not an annotation.
+      * TARGET IDENTITY (round-2 Q2): a trustworthy target is REQUIRED. Only bodies
+        of declarations named in target_names mask; anonymous `example` never masks.
+        With no target information this function masks NOTHING (returns [], 0, 0);
+        the caller counts such rows as identity_missing and leaves PG intact. There
+        is no any-named-declaration fallback -- a non-Lean caller must not acquire
+        Lean feedback masking accidentally.
+      * FULL COMMENT COVERAGE (round-2 P1): endpoint classification is not enough --
+        line-comment endpoints or two separate block comments can sandwich live
+        tactics that would then be hidden from PG. Every position of the semantic
+        span must lie inside a comment lexical region or be whitespace; otherwise
+        the span stays PG-eligible. Bare <feedback> tags in code position are code.
+      * BODY BOUNDARY (round-2 P1, rebuilt in round 3): the requested proof ends at
+        the next TOP-LEVEL unit start, found structurally rather than by bare
+        keywords -- attribute blocks and declaration modifiers (private/
+        noncomputable/local/...) are consumed first, declaration keywords count at
+        any indentation (none has a tactic form), and `set_option`/`open` are
+        boundaries only in command position (their `in`-chain continuation decides;
+        a `set_option ... in <tactic>` inside the proof does NOT end it). The outer
+        ':=' search is clipped to that candidate's own text.
+      * UNCLOSED FINAL FENCE: a COMPLETE comment inside an unfinished proof is still
+        a legitimate annotation (the budget ended the fence, not the model's intent)
+        and is maskable; anything the lexer cannot classify stays eligible.
+
+    position_rejected counts recognizer spans confidently OUTSIDE every accepted
+    body -- prose and statement-region feedback of any shape. It is BROADER than the
+    literal malformed `Here is /- <feedback>` header (step-70 audit: thousands of
+    rejected spans, one exact header string); read it as "feedback-shaped text
+    outside the requested proof", not as a malformed-header count. ambiguous_rejected
+    counts spans left eligible because the parse was uncertain; they are a different
+    diagnostic and must not be read as malformed headers.
+    """
+    global _WARNED_NO_LEXICAL
+    if not spans:
+        return [], 0, 0
+    if not target_names:
+        # Identity is a prerequisite (round-2 Q2): callers count and skip instead of
+        # reaching here; this is the safety net for direct calls.
+        return [], 0, 0
+    if _lean_scan_lexical is None or _lean_proof_assignment is None:
+        if not _WARNED_NO_LEXICAL:
+            logger.warning(
+                "lean_construction helpers unavailable; generated-feedback masking is "
+                "DISABLED (fail-open) -- add the reward repo's src to PYTHONPATH"
+            )
+            _WARNED_NO_LEXICAL = True
+        return [], 0, len(spans)
+
+    bodies, lex_regions, ambiguous_zones = _lean_proof_regions(text, target_names)
 
     valid: list = []
     position_rejected = 0
@@ -1033,6 +1042,17 @@ def _warn_sdpo_reward_has_no_gradient_path(config) -> bool:
     if _truthy(algorithm_cfg.get("neutralize_attempt_penalty_in_all_fail_groups", False)):
         inert.append("algorithm.neutralize_attempt_penalty_in_all_fail_groups "
                      "(lean/attempt_penalty_* still logs, but refunds an advantage nobody reads)")
+
+    actor_cfg = config.get("actor_rollout_ref", {}).get("actor", {})
+    imitation_coef = actor_cfg.get("self_distillation", {}).get("verified_self_imitation_coef", 0.0)
+    if imitation_coef > 0:
+        logger.warning(
+            "SDPO hybrid: failed attempts use repair distillation; verified EOS-terminated "
+            "answers use per-theorem self-imitation CE (coefficient=%s). GRPO advantages "
+            "and reward shaping do not enter either loss. Verified status gates the CE targets.",
+            imitation_coef,
+        )
+        return True
 
     logger.warning(
         "loss_mode=sdpo: the self-distillation KL REPLACES the policy-gradient term "
@@ -2593,29 +2613,12 @@ class RayPPOTrainer:
         use_fallback_environment_feedback: bool = True,
         valid_reward_flags: Optional[list[bool]] = None,
     ) -> list[str | None]:
-        """Per-row teacher context: the row's OWN attempt, never a sibling's.
+        """Collect each row's own canonical annotation or optional status fallback.
 
-        Two sources, in order. The canonical Lean annotation if the reward produced one,
-        otherwise -- when use_fallback_environment_feedback is on -- a one-sentence status
-        note from _lean_status_fallback_feedback.
-
-        VERIFIED ROWS TAKE THE CANONICAL BRANCH TOO, and that is deliberate: it is the
-        only branch that keeps a row's teacher context its own. Measured over steps
-        100-125 of qwen3-sft-feedback-grpo-lr2e6, 2,091 of 2,091 verified rows carry
-        has_canonical_feedback=True (the annotation of a verified proof is the correct
-        proof carrying proof-state blocks, not error blocks), so on an arm running
-        environment_feedback_only_without_solution=false all of them are reprompted with
-        their own proof through proof_repair_template -- ~45% of the 4,605 targets. That
-        teacher's context CONTAINS the tokens it is scoring, i.e. self-imitation at
-        maximal confidence. Sending them down the solution branch instead is strictly
-        worse for this arm: _get_solution hands out ONE demonstration per group, so 1,406
-        of them would be scored against a DIFFERENT row's proof -- the sibling proof the
-        routing decision exists to eliminate -- through the generic template the
-        checkpoint was never SFT'd on.
-
-        The `status != _LEAN_VERIFIED_STATUS` guard below therefore only governs the
-        FALLBACK: a verified row with no annotation at all (0 occurrences in 6,656 rows)
-        gets nothing rather than a status note, because there is no error to name.
+        Legacy callers receive annotations for verified proofs too. The verified
+        self-imitation branch in the batch builder removes those before rendering
+        any teacher prompt: a correct proof is not a repair example. It is learned
+        as an output under the original student prompt instead.
         """
         feedback_list: list[str | None] = [None] * batch_size
         if not include_environment_feedback or not reward_extra_infos_dict:
@@ -2641,11 +2644,7 @@ class RayPPOTrainer:
                 continue
             if idx < len(statuses):
                 status = str(statuses[idx])
-                # Fallback only. A verified row that reached here has no annotation to
-                # describe and no error to name, so it is left without feedback;
-                # _LEAN_VERIFIED_STATUS is the single producer of that fact. This is NOT
-                # a statement that verified rows get no teacher context -- see the
-                # docstring: they take the canonical branch above.
+                # A verified row has no error to describe with a fallback.
                 if status and status != _LEAN_VERIFIED_STATUS:
                     code = clean_code[idx] if idx < len(clean_code) and isinstance(clean_code[idx], str) else ""
                     feedback_list[idx] = _lean_status_fallback_feedback(status, code)
@@ -2717,6 +2716,62 @@ class RayPPOTrainer:
             # arms, and even on it that is ~group_size passes against a minutes-long step.
             candidates = [self._remove_thinking_trace(text) for text in candidates]
         return min(candidates, key=len)
+
+    def _sdpo_proof_response_mask(self, batch, response_texts, response_lengths, reward_extra_infos_dict):
+        """A separate SDPO token mask; never narrow the reference-KL row/token mask."""
+        if _lean_scan_lexical is None or _lean_proof_assignment is None:
+            raise RuntimeError("distill_proof_only requires training.grpo.lean_construction on PYTHONPATH")
+        responses = batch.batch["responses"]
+        result = torch.zeros_like(batch.batch["response_mask"])
+        targets = reward_extra_infos_dict.get("theorem_statement_target", [])
+        if len(targets) != len(batch):
+            raise ValueError("distill_proof_only requires one theorem_statement_target per response")
+        special_ids = set(getattr(self.tokenizer, "all_special_ids", None) or [])
+        missing_target = unmatched = alignment_failed = 0
+        for row, (ids, text, length, target) in enumerate(
+            zip(responses.detach().cpu(), response_texts, response_lengths, targets, strict=True)
+        ):
+            head = _MASK_DECL_HEAD_RE.search(str(target or ""))
+            name = _MASK_DECL_NAME_RE.match(str(target), head.end()) if head else None
+            if name is None or head.group(1) == "example":
+                missing_target += 1
+                continue
+            spans, _, _ = _lean_proof_regions(text, {name.group(1)})
+            if not spans:
+                unmatched += 1
+                continue
+            token_ids = ids[:length].tolist()
+            visible = [i for i, token_id in enumerate(token_ids) if token_id not in special_ids]
+            selected = None
+            try:
+                encoded = self.tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+                offsets = list(encoded.get("offset_mapping", []))
+                if (list(encoded["input_ids"]) == [token_ids[i] for i in visible]
+                        and len(offsets) == len(visible)):
+                    selected = [visible[i] for i, (start, end) in enumerate(offsets)
+                                if end > start and _span_contained(start, end, spans)]
+            except (TypeError, ValueError, NotImplementedError):
+                pass
+            if selected is None:
+                token_bytes = getattr(self, "_feedback_token_bytes", _UNSET)
+                if token_bytes is _UNSET:
+                    token_bytes = _build_feedback_token_bytes(self.tokenizer)
+                    self._feedback_token_bytes = token_bytes
+                selected = _feedback_token_indices_from_bytes(token_ids, text, spans, token_bytes)
+            if selected is None:
+                alignment_failed += 1
+                continue
+            result[row, selected] = 1
+        metrics = {
+            "self_distillation/proof_only_enabled": 1.0,
+            "self_distillation/proof_mask_missing_target_fraction": missing_target / len(batch),
+            "self_distillation/proof_mask_unmatched_fraction": unmatched / len(batch),
+            "self_distillation/proof_mask_alignment_failed_fraction": alignment_failed / len(batch),
+            "self_distillation/proof_mask_empty_fraction": float((~result.bool().any(dim=-1)).float().mean()),
+            "self_distillation/proof_token_fraction": float(result.sum())
+            / max(float(batch.batch["response_mask"].sum()), 1.0),
+        }
+        return result, metrics
 
     def _maybe_build_self_distillation_batch(
         self,
@@ -2800,6 +2855,15 @@ class RayPPOTrainer:
             for idx in range(batch_size)
         ]
 
+        proof_response_mask = None
+        proof_mask_metrics = {}
+        if _truthy(self_distillation_cfg.get("distill_proof_only", False)):
+            proof_response_mask, proof_mask_metrics = self._sdpo_proof_response_mask(
+                batch, response_texts, response_lengths, reward_extra_infos_dict
+            )
+            has_proof_tokens = proof_response_mask.bool().any(dim=-1).tolist()
+            target_valid_flags = [valid and has_proof_tokens[i] for i, valid in enumerate(target_valid_flags)]
+
         feedback_list = self._collect_feedback(
             include_environment_feedback=_truthy(self_distillation_cfg.get("include_environment_feedback", True)),
             reward_extra_infos_dict=reward_extra_infos_dict,
@@ -2809,12 +2873,46 @@ class RayPPOTrainer:
             ),
             valid_reward_flags=target_valid_flags,
         )
+        imitation_enabled = float(self_distillation_cfg.get("verified_self_imitation_coef", 0.0)) > 0
+        verified_flags = [False] * batch_size
+        imitation_flags = [False] * batch_size
+        imitation_weights = None
+        if imitation_enabled:
+            statuses = (reward_extra_infos_dict or {}).get("lean_status", [])
+            if len(statuses) != batch_size:
+                raise ValueError("Verified self-imitation requires a Lean status for every response")
+            verified_flags = [str(status) == _LEAN_VERIFIED_STATUS for status in statuses]
+            eos_id = self.tokenizer.eos_token_id
+            if eos_id is None:
+                raise ValueError("Verified self-imitation requires an EOS token")
+            for idx, verified in enumerate(verified_flags):
+                if verified:
+                    # Never ask the repair model to fix an already correct answer,
+                    # even if this response is ineligible for imitation (e.g. clipped).
+                    feedback_list[idx] = None
+                    imitation_flags[idx] = (
+                        target_valid_flags[idx]
+                        and response_lengths[idx] > 0
+                        and int(responses[idx, response_lengths[idx] - 1]) == eos_id
+                    )
+            group_sizes: dict[Any, int] = defaultdict(int)
+            group_successes: dict[Any, int] = defaultdict(int)
+            for uid, eligible in zip(batch.non_tensor_batch["uid"], imitation_flags, strict=True):
+                group_sizes[uid] += 1
+                group_successes[uid] += int(eligible)
+            # The actor averages across ALL rows/ranks. n/k converts that average
+            # to an equal-weight mean over the k verified answers for each theorem.
+            imitation_weights = torch.tensor([
+                group_sizes[uid] / group_successes[uid] if eligible else 0.0
+                for uid, eligible in zip(batch.non_tensor_batch["uid"], imitation_flags, strict=True)
+            ], dtype=torch.float32, device=device)
         success_by_uid = self._collect_solutions_by_uid(
             batch,
             reward_tensor,
             success_reward_threshold=float(self_distillation_cfg.get("success_reward_threshold", 1.0)),
             valid_sample_flags=target_valid_flags,
         )
+        use_solution_demonstrations = _truthy(self_distillation_cfg.get("use_solution_demonstrations", True))
         solution_strs = [
             (
                 self._get_solution(
@@ -2825,7 +2923,7 @@ class RayPPOTrainer:
                     _truthy(self_distillation_cfg.get("dont_reprompt_on_self_success", False)),
                     _truthy(self_distillation_cfg.get("remove_thinking_from_demonstration", False)),
                 )
-                if target_valid_flags[idx]
+                if target_valid_flags[idx] and use_solution_demonstrations and not verified_flags[idx]
                 else None
             )
             for idx in range(batch_size)
@@ -2845,8 +2943,13 @@ class RayPPOTrainer:
             use_feedback = has_feedback and (not feedback_only_without_solution or not has_solution)
             feedback_format = self_distillation_cfg.get("environment_feedback_format", "generic")
 
-            if use_feedback and feedback_format == "sft_proof_repair":
-                reprompt_text = self_distillation_cfg.proof_repair_template.format(
+            if use_feedback and feedback_format in {"sft_proof_repair", "sft_classic_proof_repair"}:
+                template = (
+                    self_distillation_cfg.classic_proof_repair_template
+                    if feedback_format == "sft_classic_proof_repair"
+                    else self_distillation_cfg.proof_repair_template
+                )
+                reprompt_text = template.format(
                     prompt=prompt_texts[idx].rstrip(),
                     failed_attempt=feedback_list[idx].strip(),
                 )
@@ -2910,6 +3013,8 @@ class RayPPOTrainer:
             return list(ids)
 
         reprompt_ids = [_tokenize_reprompt(msgs) for msgs in messages]
+        skip_overlong_reprompts = _truthy(self_distillation_cfg.get("skip_overlong_reprompts", False))
+        overlong_reprompt_flags = [False] * batch_size
         reprompt_elided_flags: list[bool] = []
         reprompt_dropped: list[int] = []
         kept_ids: list[list[int]] = []
@@ -2918,6 +3023,20 @@ class RayPPOTrainer:
             if max_teacher_total_len is not None:
                 budget = min(budget, max_teacher_total_len - response_lengths[idx])
             budget = max(budget, min_reprompt_len)
+            if len(ids) > budget and skip_overlong_reprompts:
+                # Keep full compiler output or provide no distillation target.
+                # The inactive row still needs a bounded teacher forward so FSDP
+                # collectives stay aligned across ranks. Use its original prompt.
+                overlong_reprompt_flags[idx] = target_valid_flags[idx]
+                target_valid_flags[idx] = False
+                original_messages = list(raw_prompts[idx]) if raw_prompts is not None else [
+                    {"role": "user", "content": prompt_texts[idx]}
+                ]
+                ids = _tokenize_reprompt(original_messages)[-budget:]
+                reprompt_dropped.append(0)
+                reprompt_elided_flags.append(False)
+                kept_ids.append(ids)
+                continue
             if len(ids) > budget:
                 head = budget // 2
                 tail = budget - head
@@ -2976,7 +3095,8 @@ class RayPPOTrainer:
             "self_distillation/feedback_used_fraction": sum(feedback_used) / batch_size,
             "self_distillation/sft_proof_repair_fraction": sum(
                 feedback_used[idx]
-                and self_distillation_cfg.get("environment_feedback_format", "generic") == "sft_proof_repair"
+                and self_distillation_cfg.get("environment_feedback_format", "generic")
+                in {"sft_proof_repair", "sft_classic_proof_repair"}
                 for idx in range(batch_size)
             )
             / batch_size,
@@ -2991,6 +3111,7 @@ class RayPPOTrainer:
             )
             / batch_size,
             "self_distillation/target_skipped_fraction": 1.0 - (sum(target_valid_flags) / batch_size),
+            "self_distillation/overlong_reprompt_skipped_fraction": sum(overlong_reprompt_flags) / batch_size,
             # Reprompt shrinkage was previously invisible: apply_chat_template's
             # truncation=True emits no warning and nothing read the prompt width.
             "self_distillation/reprompt_elided_fraction": sum(reprompt_elided_flags) / batch_size,
@@ -3010,7 +3131,23 @@ class RayPPOTrainer:
             if target_response_lengths
             else 0.0,
             "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),
+            **proof_mask_metrics,
         }
+        if imitation_enabled:
+            metrics.update({
+                "self_distillation/verified_sample_fraction": sum(verified_flags) / batch_size,
+                "self_distillation/verified_ce_sample_fraction": sum(imitation_flags) / batch_size,
+                "self_distillation/verified_ce_group_fraction": sum(
+                    count > 0 for count in group_successes.values()
+                ) / max(len(unique_uids), 1),
+                "self_distillation/verified_ce_ineligible_fraction": sum(
+                    verified and not eligible
+                    for verified, eligible in zip(verified_flags, imitation_flags, strict=True)
+                ) / batch_size,
+                "self_distillation/verified_repair_overlap_fraction": sum(
+                    verified_flags[idx] and bool(self_distillation_mask[idx]) for idx in range(batch_size)
+                ) / batch_size,
+            })
         return (
             DataProto.from_dict(
                 tensors={
@@ -3018,6 +3155,10 @@ class RayPPOTrainer:
                     "teacher_attention_mask": teacher_attention_mask,
                     "teacher_position_ids": teacher_position_ids,
                     "self_distillation_mask": self_distillation_mask,
+                    **({"verified_self_imitation_weights": imitation_weights}
+                       if imitation_weights is not None else {}),
+                    **({"self_distillation_response_mask": proof_response_mask}
+                       if proof_response_mask is not None else {}),
                 }
             ),
             metrics,

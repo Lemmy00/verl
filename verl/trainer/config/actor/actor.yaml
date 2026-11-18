@@ -140,6 +140,11 @@ feedback_loss:
 # SDPO self-distillation config
 self_distillation:
 
+  # upstream selects the pinned lasgroup/SDPO actor and loss, with a separate EMA teacher.
+  implementation: local
+  teacher_regularization: ema
+  teacher_update_rate: 0.01
+
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: verl.workers.config.SelfDistillationConfig
 
@@ -148,6 +153,10 @@ self_distillation:
 
   # Multiplier on the SDPO loss before adding actor KL regularization
   loss_coef: 1.0
+
+  # Local hybrid extension: per-theorem CE on verified, EOS-terminated responses.
+  # These responses receive no repair SDPO. Zero disables the extension.
+  verified_self_imitation_coef: 0.0
 
   # KL interpolation coefficient: 0.0 forward KL, 1.0 reverse KL
   alpha: 0.0
@@ -202,6 +211,18 @@ self_distillation:
 
   # Environment feedback prompt format. "sft_proof_repair" matches the Lean SFT repair rows.
   environment_feedback_format: sft_proof_repair
+
+  # Use only the row's own compiler feedback when false.
+  use_solution_demonstrations: true
+
+  # Mask over-budget teacher contexts instead of eliding their code or feedback.
+  skip_overlong_reprompts: false
+
+  # Teach only tokens in the requested Lean proof body; reference KL stays full-response.
+  distill_proof_only: false
+
+  # Exact repair-question suffix from formalmathatepfl/sft_classic (proof_repair=true).
+  classic_proof_repair_template: "{prompt}\n\nThe complete typechecked Lean 4 proof is:\n\n```lean4\n{failed_attempt}\n```"
 
   # SFT proof-repair prompt template with the annotated failed attempt in a Lean block.
   # MUST mirror the SFT proof-repair prompt exactly, or the teacher is conditioned on a

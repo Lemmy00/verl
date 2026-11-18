@@ -1,0 +1,25 @@
+{
+  "repository": "https://github.com/lasgroup/SDPO",
+  "commit": "7c457fc1b1f636ae794eb0362ba37d4743b06fbc",
+  "actor": "verl/workers/actor/dp_actor.py",
+  "loss_functions": [
+    "agg_loss",
+    "compute_self_distillation_loss"
+  ],
+  "actor_modifications": [
+    "Import the pinned loss module instead of local core_algos.",
+    "Expose _sdpo_extra_batch_keys and _compute_sdpo_loss hooks for the optional Lean verified-answer CE extension. The provenance test removes exactly these hooks before comparing the original AST hash; the pinned loss, forwards, optimizer, and EMA remain unchanged."
+  ],
+  "upstream_actor_sha256": "cfb30b67b30f61e63966e84a3bdcc894937e5d9eba0bcc42e6210030c03e7fbd",
+  "upstream_core_sha256": "4f949c323f005b4945f1983bdf89a9ddbd53865d0d7511993c37fbe7c47d6903",
+  "ast_sha256": {
+    "workers/actor/sdpo_upstream.py": {
+      "DataParallelPPOActor": "fc4cee635bd3f12a4afa889a405067572dca72cfe9e295f2c6f4e844ee625e9e",
+      "TrustRegionTeacher": "17995b043c17ccd78e0bec1a7aa60e91f43efccab9f44bf048e18b072ca1a012"
+    },
+    "trainer/ppo/sdpo_upstream.py": {
+      "agg_loss": "73ebd5b45e579288579f785e0333752d724cd74fc5f3a9e2bd6acf8b422cc150",
+      "compute_self_distillation_loss": "3aed9e3b43b74c5b1d77da9b5aeb85326dc7e8b59be04ef79c1b1c68c55bb65f"
+    }
+  }
+}

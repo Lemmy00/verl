@@ -771,6 +771,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def init_model(self):
         from verl.workers.actor import DataParallelPPOActor
 
+        actor_class = DataParallelPPOActor
+        self._upstream_sdpo = (
+            self._is_actor
+            and self.config.actor.policy_loss.get("loss_mode", "vanilla") == "sdpo"
+            and self.config.actor.get("self_distillation", {}).get("implementation", "local") == "upstream"
+        )
+        self.teacher_checkpoint_manager = None
+        if self._upstream_sdpo:
+            from verl.workers.actor.lean_sdpo import LeanSDPOActor
+
+            if not self._is_ref:
+                raise ValueError("Upstream SDPO requires the actor_rollout_ref role for its EMA teacher")
+            actor_class = LeanSDPOActor
+
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
 
@@ -830,7 +844,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self._is_actor:
             actor_cfg = omega_conf_to_dataclass(self.config.actor)
-            self.actor = DataParallelPPOActor(
+            self.actor = actor_class(
                 config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
             )
 
@@ -876,6 +890,22 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 if use_prefix_grouper:
                     self.config.ref.use_prefix_grouper = use_prefix_grouper
             self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
+
+            if self._upstream_sdpo:
+                # Same colocation and teacher assignment as lasgroup/SDPO.
+                self.actor.teacher_module = self.ref_module_fsdp
+                actor_shapes = [(n, p.shape) for n, p in self.actor_module_fsdp.named_parameters()]
+                teacher_shapes = [(n, p.shape) for n, p in self.ref_module_fsdp.named_parameters()]
+                if actor_shapes != teacher_shapes:
+                    raise ValueError("EMA actor and teacher FSDP shard layouts differ")
+                self.teacher_checkpoint_manager = FSDPCheckpointManager(
+                    model=self.ref_module_fsdp,
+                    processing_class=self.processor if self.processor is not None else self.tokenizer,
+                    checkpoint_config=OmegaConf.create({"load_contents": ["model"], "save_contents": ["model"]}),
+                    trust_remote_code=self.config.model.get("trust_remote_code", False),
+                )
+                if self.rank == 0:
+                    print("SDPO: pinned lasgroup/SDPO 7c457fc1, separate EMA teacher initialized; reference KL disabled")
 
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)
@@ -1096,6 +1126,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.checkpoint_manager.save_checkpoint(
             local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
         )
+        if self.teacher_checkpoint_manager is not None:
+            self.teacher_checkpoint_manager.save_checkpoint(
+                local_path=os.path.join(local_path, "sdpo_teacher"),
+                hdfs_path=os.path.join(hdfs_path, "sdpo_teacher") if hdfs_path else None,
+                global_step=global_step,
+                max_ckpt_to_keep=None,
+            )
         dist.barrier()
 
         if self._is_lora and hasattr(getattr(self, "actor_module", self.actor_module_fsdp), "peft_config"):
@@ -1150,9 +1187,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
+        teacher_path = os.path.join(local_path, "sdpo_teacher")
+        if self.teacher_checkpoint_manager is not None and not os.path.isdir(teacher_path):
+            raise ValueError("Cannot resume upstream SDPO without its saved EMA teacher; start from SFT instead")
+
         self.checkpoint_manager.load_checkpoint(
             local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
         )
+        if self.teacher_checkpoint_manager is not None:
+            self.teacher_checkpoint_manager.load_checkpoint(
+                local_path=teacher_path, del_local_after_load=del_local_after_load
+            )
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)

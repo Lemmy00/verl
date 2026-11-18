@@ -71,14 +71,23 @@ class RouterReplayConfig(BaseConfig):
 class SelfDistillationConfig(BaseConfig):
     """Configuration for SDPO self-distillation."""
 
+    implementation: str = "local"
+    teacher_regularization: str = "ema"
+    teacher_update_rate: float = 0.01
     full_logit_distillation: bool = True
     loss_coef: float = 1.0
+    # Local hybrid extension: reproduce verified rollouts under the original prompt.
+    # Zero keeps the unmodified SDPO objective and legacy routing.
+    verified_self_imitation_coef: float = 0.0
     alpha: float = 0.0
     success_reward_threshold: float = 1.0
     distillation_topk: Optional[int] = 20
     distillation_add_tail: bool = True
     distillation_tail_epsilon: float = 1e-4
     skip_clipped_responses: bool = False
+    skip_overlong_reprompts: bool = False
+    distill_proof_only: bool = False
+    use_solution_demonstrations: bool = True
     max_target_response_len: Optional[int] = None
     max_reprompt_len: int = 4096
     # Budget the whole teacher sequence (reprompt + response) rather than the
@@ -104,6 +113,12 @@ class SelfDistillationConfig(BaseConfig):
         "Here is the complete Lean 4 proof annotated with Lean 4 compiler feedback blocks:\n\n"
         "```lean4\n{failed_attempt}\n```\n"
     )
+    # formalmathatepfl/sft_classic, proof_repair=True. The annotated attempt is
+    # introduced as a complete proof even though its final feedback reports an error.
+    classic_proof_repair_template: str = (
+        "{prompt}\n\nThe complete typechecked Lean 4 proof is:\n\n"
+        "```lean4\n{failed_attempt}\n```"
+    )
     # Give rows with no canonical Lean annotation a status-derived teacher context;
     # see _lean_status_fallback_feedback and the note in actor.yaml.
     use_fallback_environment_feedback: bool = False
@@ -111,6 +126,14 @@ class SelfDistillationConfig(BaseConfig):
     environment_feedback_only_without_solution: bool = True
 
     def __post_init__(self):
+        if self.implementation not in {"local", "upstream"}:
+            raise ValueError(f"Unknown SDPO implementation: {self.implementation}")
+        if not 0.0 <= self.verified_self_imitation_coef < float("inf"):
+            raise ValueError("verified_self_imitation_coef must be finite and non-negative")
+        if self.verified_self_imitation_coef > 0 and self.implementation != "upstream":
+            raise ValueError("Verified self-imitation requires the upstream Lean SDPO adapter")
+        if not 0.0 <= self.teacher_update_rate <= 1.0:
+            raise ValueError("self_distillation.teacher_update_rate must be in [0, 1]")
         if self.loss_coef < 0.0:
             raise ValueError(f"self_distillation.loss_coef must be non-negative, got {self.loss_coef}")
         if not 0.0 <= self.alpha <= 1.0:
@@ -134,10 +157,10 @@ class SelfDistillationConfig(BaseConfig):
                 "self_distillation.max_target_response_len must be a positive integer or null, "
                 f"got {self.max_target_response_len}"
             )
-        if self.environment_feedback_format not in {"generic", "sft_proof_repair"}:
+        if self.environment_feedback_format not in {"generic", "sft_proof_repair", "sft_classic_proof_repair"}:
             raise ValueError(
                 "self_distillation.environment_feedback_format must be one of "
-                f"{{'generic', 'sft_proof_repair'}}, got {self.environment_feedback_format!r}"
+                f"{{'generic', 'sft_proof_repair', 'sft_classic_proof_repair'}}, got {self.environment_feedback_format!r}"
             )
         if self.distillation_topk is not None and self.distillation_topk <= 0:
             raise ValueError(
